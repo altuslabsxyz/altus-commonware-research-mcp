@@ -3,7 +3,6 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { NOTION_BASE, OAUTH_CALLBACK_URL, OAUTH_TIMEOUT_MS } from "../config.js";
 import { b64url, getMcpSessionId } from "../utils/index.js";
 import { getSession, pendingOAuth } from "../oauth/index.js";
-import { createProtectedState } from "../security.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Authorize Notion Tool
@@ -45,8 +44,7 @@ export function registerAuthorizeTool(server: McpServer): void {
       const { client_id, client_secret } = (await regRes.json()) as { client_id: string; client_secret?: string };
       const verifier = b64url(randomBytes(32));
       const challenge = b64url(createHash("sha256").update(verifier).digest());
-      // Use protected state that is cryptographically bound to this MCP session
-      const state = createProtectedState(mcpSessionId);
+      const state = randomBytes(16).toString("hex");
 
       // Store pending OAuth with MCP session ID for later association
       pendingOAuth.set(state, {
