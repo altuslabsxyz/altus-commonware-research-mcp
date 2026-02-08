@@ -36,7 +36,7 @@ export async function handleCallback(req: IncomingMessage, res: ServerResponse):
   // Security: Validate that callback IP matches the IP that initiated OAuth
   const clientIp = getClientIp(req);
   if (pending.boundIp !== "unknown" && pending.boundIp !== clientIp) {
-    console.error(`OAuth callback IP mismatch: expected ${pending.boundIp}, got ${clientIp}`);
+    console.error(`OAuth callback IP mismatch`);
     pendingOAuth.delete(state);
     res.writeHead(403, { "Content-Type": "text/html" }).end(htmlResponse("❌", "IP mismatch - security violation"));
     return;

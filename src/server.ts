@@ -77,7 +77,6 @@ export function createHttpServer(createMcpServer: McpServerFactory) {
 
         // Security: Validate that requesting IP matches the bound IP
         if (session.boundIp !== clientIp) {
-          console.error(`Session hijack attempt: session ${sessionId} bound to ${session.boundIp}, request from ${clientIp}`);
           res.writeHead(403, { "Content-Type": "application/json" }).end(
             JSON.stringify({ error: "Session bound to different IP address" })
           );
@@ -97,7 +96,6 @@ export function createHttpServer(createMcpServer: McpServerFactory) {
           onsessioninitialized: (sid) => {
             // Bind session to client IP for security
             sessions.set(sid, { transport, server: mcpServer, boundIp: clientIp });
-            console.error(`New session ${sid} bound to IP: ${clientIp}`);
           },
         });
 
