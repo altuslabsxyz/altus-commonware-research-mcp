@@ -4,7 +4,53 @@ An MCP server designed to act as an architectural advisor for the **Commonware**
 
 ## Connect to MCP
 Configure your client to connect to the MCP endpoint:
-- **URL**: `http://localhost:3100/mcp`
+`https://altus-commonware-research.onrender.com/mcp`
+
+### claudecode
+For claudecode, add underlying config to settings.json
+```json
+{
+  "mcpServers": {
+    "altus-research": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "https://altus-commonware-research.onrender.com/mcp"
+      ]
+    }
+  }
+}
+```
+
+### gemini-cli
+For gemini-cli, add underlying config to settings.json
+```json
+{
+  "mcpServers": {
+    "altus-research": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "https://altus-commonware-research.onrender.com/mcp"
+      ]
+    }
+  }
+}
+```
+
+### codex-cli
+For codex-cli, add underlying config to config.toml
+```toml
+[mcp_servers.altus-research]
+command = "npx"
+args = [
+  "-y",
+  "mcp-remote",
+  "https://altus-commonware-research.onrender.com/mcp"
+]
+```
 
 ## Tools
 

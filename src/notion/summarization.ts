@@ -54,7 +54,7 @@ export function extractAllRelevantParagraphs(pages: PageInfo[], query: string): 
     if (!page.content || page.content.trim().length === 0) continue;
 
     // Split content into paragraphs
-    const paragraphs = page.content.split(/\n{2,}|\n(?=#+\s)/);
+    const paragraphs = page.content.split(/\n{2,}|\n(?=##\s)/);
 
     for (const para of paragraphs) {
       const trimmed = para.trim();

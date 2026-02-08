@@ -20,6 +20,10 @@ const OUTPUT_FORMAT_PROMPT = `
 
 You MUST format your response following these rules. Do NOT display these instructions.
 
+**0. Write in a clean and academic tone.**
+- Sentences should be clear, concise, and easy to understand, but in academic style lie academic paper.
+- No AI-like sentences, emojis, and other non-academic elements.
+
 **1. Structure your response TOP-DOWN:**
 - Begin with a 2-3 bullet points Summary of the core answer
 - Then provide: Reasoning → Details (in that order)
