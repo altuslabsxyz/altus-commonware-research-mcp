@@ -7,18 +7,26 @@ import { parseBody } from "./utils/index.js";
 import { handleCallback } from "./oauth/index.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Transport State
+// Session State (transport + server per session)
 // ─────────────────────────────────────────────────────────────────────────────
-const transports = new Map<string, StreamableHTTPServerTransport>();
+interface Session {
+  transport: StreamableHTTPServerTransport;
+  server: McpServer;
+}
+
+const sessions = new Map<string, Session>();
 
 export function getTransports() {
-  return transports;
+  return new Map([...sessions].map(([k, v]) => [k, v.transport]));
 }
+
+// Factory function type for creating new MCP server instances
+export type McpServerFactory = () => McpServer;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HTTP Server with Streamable HTTP Transport
 // ─────────────────────────────────────────────────────────────────────────────
-export function createHttpServer(mcpServer: McpServer) {
+export function createHttpServer(createMcpServer: McpServerFactory) {
   const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url ?? "/", `http://localhost:${MCP_PORT}`);
 
@@ -37,25 +45,34 @@ export function createHttpServer(mcpServer: McpServer) {
     if (url.pathname === "/mcp") {
       const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
-      // Reuse existing transport for session
-      if (sessionId && transports.has(sessionId)) {
-        const transport = transports.get(sessionId)!;
+      // Reuse existing session
+      if (sessionId && sessions.has(sessionId)) {
+        const session = sessions.get(sessionId)!;
         const body = await parseBody(req);
-        await transport.handleRequest(req, res, body);
+        await session.transport.handleRequest(req, res, body);
         return;
       }
 
-      // New session - create transport
+      // New session - create transport AND new McpServer instance
       if (req.method === "POST" || req.method === "GET") {
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (sid) => {
-            transports.set(sid, transport);
+            sessions.set(sid, { transport, server: mcpServer });
           },
         });
 
+        // Create a NEW McpServer instance for this session
+        const mcpServer = createMcpServer();
+
         transport.onclose = () => {
-          if (transport.sessionId) transports.delete(transport.sessionId);
+          if (transport.sessionId) {
+            const session = sessions.get(transport.sessionId);
+            if (session) {
+              session.server.close().catch(() => { });
+            }
+            sessions.delete(transport.sessionId);
+          }
         };
 
         await mcpServer.connect(transport);
@@ -76,7 +93,7 @@ export function createHttpServer(mcpServer: McpServer) {
 
     // Health check
     if (req.method === "GET" && url.pathname === "/health") {
-      res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ status: "ok", sessions: transports.size }));
+      res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ status: "ok", sessions: sessions.size }));
       return;
     }
 
@@ -91,9 +108,10 @@ export function createHttpServer(mcpServer: McpServer) {
 // ─────────────────────────────────────────────────────────────────────────────
 export async function shutdown(httpServer: ReturnType<typeof createServer>): Promise<void> {
   console.error("Shutting down...");
-  for (const [, transport] of transports) {
-    await transport.close().catch(() => { });
+  for (const [, session] of sessions) {
+    await session.transport.close().catch(() => { });
+    await session.server.close().catch(() => { });
   }
-  transports.clear();
+  sessions.clear();
   httpServer.close();
 }

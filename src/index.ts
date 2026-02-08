@@ -4,17 +4,18 @@ import { registerTools } from "./tools/index.js";
 import { createHttpServer, shutdown } from "./server.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MCP Server Setup
+// MCP Server Factory - Creates a new instance per session
 // ─────────────────────────────────────────────────────────────────────────────
-const server = new McpServer({ name: "altus-tutor-mcp", version: "1.0.0" });
-
-// Register all tools
-registerTools(server);
+function createMcpServer(): McpServer {
+  const server = new McpServer({ name: "altus-tutor-mcp", version: "1.0.0" });
+  registerTools(server);
+  return server;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Startup
 // ─────────────────────────────────────────────────────────────────────────────
-const httpServer = createHttpServer(server);
+const httpServer = createHttpServer(createMcpServer);
 
 httpServer.listen(MCP_PORT, () => {
   console.error(`altus-tutor-mcp running on http://localhost:${MCP_PORT}`);
