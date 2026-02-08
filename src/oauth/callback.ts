@@ -60,7 +60,9 @@ export async function handleCallback(req: IncomingMessage, res: ServerResponse):
     }
 
     const data = (await tokenRes.json()) as { access_token: string; refresh_token?: string; expires_in?: number };
-    setSession({
+
+    // Set session for the SPECIFIC MCP session that initiated this OAuth flow
+    setSession(pending.mcpSessionId, {
       accessToken: data.access_token,
       refreshToken: data.refresh_token,
       expiresAt: data.expires_in ? Date.now() + data.expires_in * 1000 : undefined,

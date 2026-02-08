@@ -1,8 +1,8 @@
 import { randomBytes, createHash } from "node:crypto";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { NOTION_BASE, OAUTH_CALLBACK_URL, OAUTH_TIMEOUT_MS } from "../config.js";
-import { b64url } from "../utils/index.js";
-import { session, pendingOAuth } from "../oauth/index.js";
+import { b64url, getMcpSessionId } from "../utils/index.js";
+import { getSession, pendingOAuth } from "../oauth/index.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Authorize Notion Tool
@@ -14,7 +14,11 @@ export function registerAuthorizeTool(server: McpServer): void {
     description: "Connect to Notion (required once per session).",
     inputSchema: {},
   }, async () => {
-    if (session) return { content: [{ type: "text", text: "Already connected." }] };
+    const mcpSessionId = getMcpSessionId(server);
+
+    if (getSession(mcpSessionId)) {
+      return { content: [{ type: "text", text: "Already connected." }] };
+    }
 
     try {
       // Clean up expired OAuth states
@@ -42,7 +46,15 @@ export function registerAuthorizeTool(server: McpServer): void {
       const challenge = b64url(createHash("sha256").update(verifier).digest());
       const state = randomBytes(16).toString("hex");
 
-      pendingOAuth.set(state, { verifier, clientId: client_id, clientSecret: client_secret, redirectUri, createdAt: Date.now() });
+      // Store pending OAuth with MCP session ID for later association
+      pendingOAuth.set(state, {
+        verifier,
+        clientId: client_id,
+        clientSecret: client_secret,
+        redirectUri,
+        createdAt: Date.now(),
+        mcpSessionId,
+      });
 
       const authUrl = `${NOTION_BASE}/authorize?${new URLSearchParams({
         response_type: "code",

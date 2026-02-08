@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { session } from "../oauth/index.js";
+import { getSession } from "../oauth/index.js";
+import { getMcpSessionId } from "../utils/index.js";
 import { callNotion } from "../notion/index.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -15,10 +16,14 @@ export function registerGetPageTool(server: McpServer): void {
       page_id: z.string().describe("Notion page ID"),
     },
   }, async ({ page_id }) => {
-    if (!session) return { content: [{ type: "text", text: "Not connected. Use 'authorize_notion' first." }] };
+    const mcpSessionId = getMcpSessionId(server);
+
+    if (!getSession(mcpSessionId)) {
+      return { content: [{ type: "text", text: "Not connected. Use 'authorize_notion' first." }] };
+    }
 
     try {
-      const page = await callNotion("notion-fetch", { id: page_id });
+      const page = await callNotion(mcpSessionId, "notion-fetch", { id: page_id });
       return { content: [{ type: "text", text: JSON.stringify({ page }, null, 2) }] };
     } catch (e) {
       return { content: [{ type: "text", text: `Error: ${e}` }] };

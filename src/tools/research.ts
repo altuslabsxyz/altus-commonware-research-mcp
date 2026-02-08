@@ -2,7 +2,8 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ROOT_PAGE_IDS } from "../config.js";
 import type { PageInfo } from "../types.js";
-import { session } from "../oauth/index.js";
+import { getSession } from "../oauth/index.js";
+import { getMcpSessionId } from "../utils/index.js";
 import {
   callNotion,
   extractText,
@@ -110,12 +111,13 @@ IMPORTANT: If authorization is required, wait for the user to complete it. Do NO
     },
   }, async ({ query, max_depth = 5 }) => {
     max_depth = Math.max(max_depth, 5);
+    const mcpSessionId = getMcpSessionId(server);
 
     if (ROOT_PAGE_IDS.length === 0) {
       return { content: [{ type: "text", text: "Set NOTION_PAGE_IDS in .env (comma-separated page IDs)." }] };
     }
 
-    if (!session) {
+    if (!getSession(mcpSessionId)) {
       return { content: [{ type: "text", text: "Not connected to Notion. Please run 'authorize_notion' first." }] };
     }
 
@@ -127,7 +129,7 @@ IMPORTANT: If authorization is required, wait for the user to complete it. Do NO
       visited.add(pageId);
 
       try {
-        const pageData = await callNotion("notion-fetch", { id: pageId });
+        const pageData = await callNotion(mcpSessionId, "notion-fetch", { id: pageId });
         const content = extractText(pageData);
         const title = content.split(/\s+/).slice(0, 15).join(" ").substring(0, 150) || pageId;
 
@@ -150,7 +152,7 @@ IMPORTANT: If authorization is required, wait for the user to complete it. Do NO
 
     for (const rootId of ROOT_PAGE_IDS) {
       try {
-        const rootData = await callNotion("notion-fetch", { id: rootId });
+        const rootData = await callNotion(mcpSessionId, "notion-fetch", { id: rootId });
         const researchPages = extractResearchSectionPages(rootData);
         if (researchPages.length === 0) continue;
 

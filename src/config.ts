@@ -26,3 +26,4 @@ export const ROOT_PAGE_IDS = (process.env.NOTION_PAGE_IDS ?? "").split(",").map(
 // ─────────────────────────────────────────────────────────────────────────────
 export const OAUTH_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 export const TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000; // 5 minutes before expiry
+
