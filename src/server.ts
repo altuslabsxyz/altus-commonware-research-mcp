@@ -22,10 +22,18 @@ export function getTransports() {
 }
 
 /**
+ * Get the bound IP address for a given session ID.
+ * Used by OAuth flow to ensure callbacks match the initiating client.
+ */
+export function getSessionBoundIp(sessionId: string): string | null {
+  return sessions.get(sessionId)?.boundIp ?? null;
+}
+
+/**
  * Extract client IP address from request.
  * Handles Cloud Run's X-Forwarded-For header and direct connections.
  */
-function getClientIp(req: IncomingMessage): string {
+export function getClientIp(req: IncomingMessage): string {
   // Cloud Run / reverse proxy: use X-Forwarded-For header
   const forwarded = req.headers["x-forwarded-for"];
   if (forwarded) {

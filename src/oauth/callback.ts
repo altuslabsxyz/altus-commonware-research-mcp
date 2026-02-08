@@ -2,6 +2,7 @@ import { type IncomingMessage, type ServerResponse } from "node:http";
 import { NOTION_BASE, MCP_PORT } from "../config.js";
 import { htmlResponse } from "../utils/index.js";
 import { setSession, pendingOAuth } from "./session.js";
+import { getClientIp } from "../server.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // OAuth Callback Handler
@@ -31,6 +32,16 @@ export async function handleCallback(req: IncomingMessage, res: ServerResponse):
   }
 
   const pending = pendingOAuth.get(state)!;
+
+  // Security: Validate that callback IP matches the IP that initiated OAuth
+  const clientIp = getClientIp(req);
+  if (pending.boundIp !== "unknown" && pending.boundIp !== clientIp) {
+    console.error(`OAuth callback IP mismatch: expected ${pending.boundIp}, got ${clientIp}`);
+    pendingOAuth.delete(state);
+    res.writeHead(403, { "Content-Type": "text/html" }).end(htmlResponse("❌", "IP mismatch - security violation"));
+    return;
+  }
+
   pendingOAuth.delete(state);
 
   if (!code) {

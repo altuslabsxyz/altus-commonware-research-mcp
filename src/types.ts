@@ -15,6 +15,7 @@ export type OAuthPending = {
   clientSecret?: string;
   redirectUri: string;
   createdAt: number;
+  boundIp: string; // IP address that initiated OAuth for security validation
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

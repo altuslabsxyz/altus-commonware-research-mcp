@@ -3,6 +3,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { NOTION_BASE, OAUTH_CALLBACK_URL, OAUTH_TIMEOUT_MS } from "../config.js";
 import { b64url, getMcpSessionId } from "../utils/index.js";
 import { getSession, pendingOAuth } from "../oauth/index.js";
+import { getSessionBoundIp } from "../server.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Authorize Notion Tool
@@ -47,6 +48,8 @@ export function registerAuthorizeTool(server: McpServer): void {
       const state = randomBytes(16).toString("hex");
 
       // Store pending OAuth with MCP session ID for later association
+      // Get the bound IP from the MCP session for security validation
+      const boundIp = getSessionBoundIp(mcpSessionId) ?? "unknown";
       pendingOAuth.set(state, {
         verifier,
         clientId: client_id,
@@ -54,6 +57,7 @@ export function registerAuthorizeTool(server: McpServer): void {
         redirectUri,
         createdAt: Date.now(),
         mcpSessionId,
+        boundIp,
       });
 
       const authUrl = `${NOTION_BASE}/authorize?${new URLSearchParams({
