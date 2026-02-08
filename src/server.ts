@@ -7,17 +7,34 @@ import { parseBody } from "./utils/index.js";
 import { handleCallback } from "./oauth/index.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Session State (transport + server per session)
+// Session State (transport + server per session, with IP binding for security)
 // ─────────────────────────────────────────────────────────────────────────────
 interface Session {
   transport: StreamableHTTPServerTransport;
   server: McpServer;
+  boundIp: string; // IP address bound to this session for security
 }
 
 const sessions = new Map<string, Session>();
 
 export function getTransports() {
   return new Map([...sessions].map(([k, v]) => [k, v.transport]));
+}
+
+/**
+ * Extract client IP address from request.
+ * Handles Cloud Run's X-Forwarded-For header and direct connections.
+ */
+function getClientIp(req: IncomingMessage): string {
+  // Cloud Run / reverse proxy: use X-Forwarded-For header
+  const forwarded = req.headers["x-forwarded-for"];
+  if (forwarded) {
+    // X-Forwarded-For can be comma-separated list; first is the original client
+    const firstIp = Array.isArray(forwarded) ? forwarded[0] : forwarded.split(",")[0];
+    return firstIp.trim();
+  }
+  // Direct connection: use socket address
+  return req.socket.remoteAddress ?? "unknown";
 }
 
 // Factory function type for creating new MCP server instances
@@ -48,6 +65,17 @@ export function createHttpServer(createMcpServer: McpServerFactory) {
       // Reuse existing session
       if (sessionId && sessions.has(sessionId)) {
         const session = sessions.get(sessionId)!;
+        const clientIp = getClientIp(req);
+
+        // Security: Validate that requesting IP matches the bound IP
+        if (session.boundIp !== clientIp) {
+          console.error(`Session hijack attempt: session ${sessionId} bound to ${session.boundIp}, request from ${clientIp}`);
+          res.writeHead(403, { "Content-Type": "application/json" }).end(
+            JSON.stringify({ error: "Session bound to different IP address" })
+          );
+          return;
+        }
+
         const body = await parseBody(req);
         await session.transport.handleRequest(req, res, body);
         return;
@@ -55,10 +83,13 @@ export function createHttpServer(createMcpServer: McpServerFactory) {
 
       // New session - create transport AND new McpServer instance
       if (req.method === "POST" || req.method === "GET") {
+        const clientIp = getClientIp(req);
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (sid) => {
-            sessions.set(sid, { transport, server: mcpServer });
+            // Bind session to client IP for security
+            sessions.set(sid, { transport, server: mcpServer, boundIp: clientIp });
+            console.error(`New session ${sid} bound to IP: ${clientIp}`);
           },
         });
 
