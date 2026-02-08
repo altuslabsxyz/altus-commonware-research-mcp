@@ -26,10 +26,9 @@ You MUST format your response following these rules. Do NOT display these instru
 - No AI-like sentences, emojis, and other non-academic elements.
 
 **1. Structure your response TOP-DOWN:**
-- Begin with a 2-3 bullet points Summary of the core answer
+- Begin with ## Summary that contains 2-3 bullet points of the core answer
 - Then provide: Reasoning → Details (in that order)
 - Use ## and ### headers for major sections
-- Separate major blocks with ---
 
 **2. Content rules:**
 - Be CONCISE: include only necessary information, boldly omit the obvious
