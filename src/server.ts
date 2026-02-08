@@ -5,6 +5,12 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { MCP_PORT } from "./config.js";
 import { parseBody } from "./utils/index.js";
 import { handleCallback } from "./oauth/index.js";
+import {
+  generateSessionSecret,
+  setSessionSecret,
+  validateSessionSecret,
+  clearSessionSecret,
+} from "./security.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Session State (transport + server per session)
@@ -33,8 +39,8 @@ export function createHttpServer(createMcpServer: McpServerFactory) {
     // CORS headers
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, mcp-session-id");
-    res.setHeader("Access-Control-Expose-Headers", "mcp-session-id");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, mcp-session-id, x-session-secret");
+    res.setHeader("Access-Control-Expose-Headers", "mcp-session-id, x-session-secret");
 
     if (req.method === "OPTIONS") {
       res.writeHead(204).end();
@@ -44,9 +50,16 @@ export function createHttpServer(createMcpServer: McpServerFactory) {
     // MCP endpoint
     if (url.pathname === "/mcp") {
       const sessionId = req.headers["mcp-session-id"] as string | undefined;
+      const sessionSecret = req.headers["x-session-secret"] as string | undefined;
 
-      // Reuse existing session
+      // Reuse existing session - REQUIRES valid session secret
       if (sessionId && sessions.has(sessionId)) {
+        if (!validateSessionSecret(sessionId, sessionSecret)) {
+          res.writeHead(401, { "Content-Type": "application/json" }).end(
+            JSON.stringify({ error: "Invalid or missing session secret" })
+          );
+          return;
+        }
         const session = sessions.get(sessionId)!;
         const body = await parseBody(req);
         await session.transport.handleRequest(req, res, body);
@@ -55,10 +68,17 @@ export function createHttpServer(createMcpServer: McpServerFactory) {
 
       // New session - create transport AND new McpServer instance
       if (req.method === "POST" || req.method === "GET") {
+        // Generate session secret for new session
+        const newSessionSecret = generateSessionSecret();
+
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (sid) => {
             sessions.set(sid, { transport, server: mcpServer });
+            // Store the session secret
+            setSessionSecret(sid, newSessionSecret);
+            // Return the secret to the client (only on initial connection)
+            res.setHeader("x-session-secret", newSessionSecret);
           },
         });
 
@@ -72,6 +92,8 @@ export function createHttpServer(createMcpServer: McpServerFactory) {
               session.server.close().catch(() => { });
             }
             sessions.delete(transport.sessionId);
+            // Clear the session secret
+            clearSessionSecret(transport.sessionId);
           }
         };
 
@@ -91,9 +113,9 @@ export function createHttpServer(createMcpServer: McpServerFactory) {
       return;
     }
 
-    // Health check
+    // Health check (no session count to avoid information leakage)
     if (req.method === "GET" && url.pathname === "/health") {
-      res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ status: "ok", sessions: sessions.size }));
+      res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ status: "ok" }));
       return;
     }
 

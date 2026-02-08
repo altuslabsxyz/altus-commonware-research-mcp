@@ -2,6 +2,7 @@ import { type IncomingMessage, type ServerResponse } from "node:http";
 import { NOTION_BASE, MCP_PORT } from "../config.js";
 import { htmlResponse } from "../utils/index.js";
 import { setSession, pendingOAuth } from "./session.js";
+import { validateProtectedState } from "../security.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // OAuth Callback Handler
@@ -32,6 +33,12 @@ export async function handleCallback(req: IncomingMessage, res: ServerResponse):
 
   const pending = pendingOAuth.get(state)!;
   pendingOAuth.delete(state);
+
+  // Validate that the state is cryptographically bound to the correct MCP session
+  if (!validateProtectedState(state, pending.mcpSessionId)) {
+    res.writeHead(400, { "Content-Type": "text/html" }).end(htmlResponse("❌", "Invalid state signature"));
+    return;
+  }
 
   if (!code) {
     res.writeHead(400, { "Content-Type": "text/html" }).end(htmlResponse("❌", "No code"));
