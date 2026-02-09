@@ -18,7 +18,7 @@ jobs:
       - name: Send Robust Keep-Alive Request
         run: |
           # ⚠️ 여기에 실제 Render 서비스 URL을 입력하세요.
-          RENDER_SERVICE_URL="https://altus-commonware-research.onrender.com/"
+          RENDER_SERVICE_URL="https://altus-commonware-research.onrender.com/health"
           
           if [ -z "$RENDER_SERVICE_URL" ]; then
             echo "Error: RENDER_SERVICE_URL is not defined."
