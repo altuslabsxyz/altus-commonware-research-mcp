@@ -10,6 +10,7 @@ import {
   extractResearchSectionPages,
   extractAllChildPages,
   flattenPages,
+  selectRelevantParagraphs,
   generateSummary,
 } from "../notion/index.js";
 
@@ -50,6 +51,25 @@ You MUST format your response following these rules. Do NOT display these instru
 - Write dense paragraphs without visual structure
 
 Now, using the research data below, answer the user's question following these formatting rules:
+`;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Context Understanding Prompt - Semantic reasoning before answering
+// ─────────────────────────────────────────────────────────────────────────────
+const CONTEXT_UNDERSTANDING_PROMPT = `
+## Context Understanding Instructions
+
+Before answering the user's question, you MUST first perform this analysis internally (do NOT show this analysis to the user):
+
+1. **Identify Domain Concepts**: Based on the research content below, identify which specific domain concepts, components, or architectural patterns the query relates to. Map the user's terminology to the precise concepts found in the research.
+
+2. **Assess Coverage**: Determine which aspects of the query are well-covered by the research (multiple paragraphs discuss it), partially covered (mentioned briefly), or not covered at all. For uncovered aspects, explicitly state that the research does not contain this information rather than speculating.
+
+3. **Trace Concept Relationships**: Identify how the concepts in the query relate to each other based on the research. Note any architectural dependencies, trade-offs, or design decisions that connect them.
+
+4. **Identify Context Gaps**: Note what the research does NOT say about the query topic. Be transparent about these gaps in your answer.
+
+Use this analysis to inform a precise, research-grounded answer. Prioritize accuracy over completeness — it is better to say "the research does not cover X" than to fill gaps with assumptions.
 `;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -169,8 +189,9 @@ IMPORTANT: If authorization is required, wait for the user to complete it. Do NO
     // Flatten all pages (intermediate + leaf) into a single list
     const allPages = flattenPages(results);
 
-    // Generate human-readable summary with query-relevant content only
-    const summary = generateSummary(query, allPages);
+    // Select relevant paragraphs, then generate formatted summary
+    const selected = selectRelevantParagraphs(allPages, query);
+    const summary = generateSummary(query, allPages, selected);
 
     const altusContext = `## Altus Research Advisor Context
 
@@ -185,7 +206,7 @@ You are synthesizing this research to become an architectural advisor for Common
 **Instructions:**
 - Focus on architectural decisions and trade-offs
 - Evaluate the sw architecture in terms of performance, scalability, modularity, and maintainability
-- Compare Actor pattern vs Mutex/Locks when relevant  
+- Compare Actor pattern vs Mutex/Locks when relevant
 - Base your answer on the research content below
 - If the research doesn't contain enough info, say so honestly
 
@@ -196,7 +217,7 @@ Here is the research content:
     return {
       content: [{
         type: "text",
-        text: OUTPUT_FORMAT_PROMPT + "\n---\n\n" + altusContext + summary
+        text: OUTPUT_FORMAT_PROMPT + "\n---\n\n" + altusContext + CONTEXT_UNDERSTANDING_PROMPT + "\n" + summary
       }]
     };
   });

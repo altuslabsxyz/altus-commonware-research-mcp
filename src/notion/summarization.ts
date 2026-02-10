@@ -75,30 +75,39 @@ export function extractAllRelevantParagraphs(pages: PageInfo[], query: string): 
   return allParagraphs;
 }
 
-export function generateSummary(query: string, pages: PageInfo[]): string {
+export function selectRelevantParagraphs(
+  pages: PageInfo[], query: string, maxCount = 10
+): ScoredParagraph[] {
+  const allParagraphs = extractAllRelevantParagraphs(pages, query);
+
+  // Sort by relevance score (descending)
+  allParagraphs.sort((a, b) => b.score - a.score);
+
+  // Deduplicate and collect top paragraphs
+  const selectedTexts: string[] = [];
+  const selected: ScoredParagraph[] = [];
+
+  for (const para of allParagraphs) {
+    if (selected.length >= maxCount) break;
+    if (isDuplicate(para.text, selectedTexts)) continue;
+
+    selected.push(para);
+    selectedTexts.push(para.text);
+  }
+
+  return selected;
+}
+
+export function generateSummary(
+  query: string, pages: PageInfo[], preselected?: ScoredParagraph[]
+): string {
   const sections: string[] = [];
   const keywords = tokenizeQuery(query);
 
   sections.push(`# Research: ${query}\n`);
   sections.push(`> Explored ${pages.length} pages | Keywords: ${keywords.join(", ")}\n`);
 
-  // Collect ALL paragraphs from ALL pages, score them globally
-  const allParagraphs = extractAllRelevantParagraphs(pages, query);
-
-  // Sort by relevance score (descending)
-  allParagraphs.sort((a, b) => b.score - a.score);
-
-  // Deduplicate and collect top paragraphs (max 10 total)
-  const selectedTexts: string[] = [];
-  const selected: ScoredParagraph[] = [];
-
-  for (const para of allParagraphs) {
-    if (selected.length >= 10) break;
-    if (isDuplicate(para.text, selectedTexts)) continue;
-
-    selected.push(para);
-    selectedTexts.push(para.text);
-  }
+  const selected = preselected ?? selectRelevantParagraphs(pages, query);
 
   if (selected.length === 0) {
     sections.push("*No content directly related to the query was found.*");

@@ -84,7 +84,7 @@ export function extractPagesFromText(text: string): { id: string; title: string 
 }
 
 export function filterExcludedPages(pages: { id: string; title: string }[]): { id: string; title: string }[] {
-  const excludePatterns = [/review/i, /wip/i];
+  const excludePatterns = [/review/i];
   return pages.filter(p => !excludePatterns.some(pattern => pattern.test(p.title)));
 }
 

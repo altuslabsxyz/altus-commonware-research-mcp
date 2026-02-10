@@ -14,5 +14,6 @@ export {
   scoreParagraph,
   isDuplicate,
   extractAllRelevantParagraphs,
+  selectRelevantParagraphs,
   generateSummary,
 } from "./summarization.js";
