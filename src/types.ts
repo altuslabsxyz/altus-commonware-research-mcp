@@ -33,4 +33,5 @@ export type ScoredParagraph = {
   score: number;
   pageId: string;
   pageTitle: string;
+  sectionHeader?: string;
 };

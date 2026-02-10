@@ -23,10 +23,68 @@ export function tokenizeQuery(query: string): string[] {
     .filter(Boolean);
 }
 
-export function scoreParagraph(text: string, keywords: string[]): number {
-  if (keywords.length === 0) return 1;
+export function generateBigrams(keywords: string[]): string[] {
+  const bigrams: string[] = [];
+  for (let i = 0; i < keywords.length - 1; i++) {
+    bigrams.push(`${keywords[i]} ${keywords[i + 1]}`);
+  }
+  return bigrams;
+}
+
+export function computeIdf(
+  paragraphs: string[],
+  keywords: string[]
+): Map<string, number> {
+  const total = paragraphs.length;
+  const idf = new Map<string, number>();
+
+  for (const kw of keywords) {
+    let count = 0;
+    for (const para of paragraphs) {
+      if (para.toLowerCase().includes(kw)) count++;
+    }
+    idf.set(kw, Math.log(total / Math.max(count, 1)) + 1);
+  }
+
+  return idf;
+}
+
+export function scoreParagraph(
+  text: string,
+  keywords: string[],
+  bigrams: string[],
+  idfWeights: Map<string, number>,
+  sectionHeader?: string
+): number {
+  if (keywords.length === 0 && bigrams.length === 0) return 1;
   const lower = text.toLowerCase();
-  return keywords.filter(kw => lower.includes(kw)).length;
+  let score = 0;
+
+  // Unigram matches weighted by IDF
+  for (const kw of keywords) {
+    if (lower.includes(kw)) {
+      score += idfWeights.get(kw) ?? 1;
+    }
+  }
+
+  // Bigram matches at 3x weight
+  for (const bg of bigrams) {
+    if (lower.includes(bg)) {
+      score += 3;
+    }
+  }
+
+  // Header keyword matches at 2x IDF weight
+  if (sectionHeader) {
+    const headerLower = sectionHeader.toLowerCase();
+    for (const kw of keywords) {
+      if (headerLower.includes(kw)) {
+        score += (idfWeights.get(kw) ?? 1) * 2;
+      }
+    }
+  }
+
+  return score;
 }
 
 export function isDuplicate(text: string, existing: string[]): boolean {
@@ -46,29 +104,65 @@ export function isDuplicate(text: string, existing: string[]): boolean {
   return false;
 }
 
-export function extractAllRelevantParagraphs(pages: PageInfo[], query: string): ScoredParagraph[] {
-  const keywords = tokenizeQuery(query);
-  const allParagraphs: ScoredParagraph[] = [];
+const HEADER_REGEX = /^#{1,6}\s+(.+)/;
+
+export function extractAllRelevantParagraphs(
+  pages: PageInfo[],
+  query: string,
+  extraKeywords?: { unigrams: string[]; bigrams: string[] }
+): ScoredParagraph[] {
+  // Merge base keywords + extra keywords (deduplicated)
+  const baseKeywords = tokenizeQuery(query);
+  const baseBigrams = generateBigrams(baseKeywords);
+
+  const allUnigrams = [...new Set([...baseKeywords, ...(extraKeywords?.unigrams ?? [])])];
+  const allBigrams = [...new Set([...baseBigrams, ...(extraKeywords?.bigrams ?? [])])];
+
+  // Pass 1: Split all pages into paragraphs, track current markdown header
+  const corpus: { text: string; pageId: string; pageTitle: string; sectionHeader?: string }[] = [];
 
   for (const page of pages) {
     if (!page.content || page.content.trim().length === 0) continue;
 
-    // Split content into paragraphs
     const paragraphs = page.content.split(/\n{2,}|\n(?=#\s)/);
+    let currentHeader: string | undefined;
 
     for (const para of paragraphs) {
       const trimmed = para.trim();
-      if (trimmed.length < 20) continue; // Skip very short paragraphs
+      if (trimmed.length < 20) continue;
 
-      const score = scoreParagraph(trimmed, keywords);
-      if (score > 0) {
-        allParagraphs.push({
-          text: trimmed,
-          score,
-          pageId: page.id,
-          pageTitle: page.title.substring(0, 100),
-        });
+      // Detect markdown headers
+      const headerMatch = trimmed.match(HEADER_REGEX);
+      if (headerMatch) {
+        currentHeader = headerMatch[1].trim();
       }
+
+      corpus.push({
+        text: trimmed,
+        pageId: page.id,
+        pageTitle: page.title.substring(0, 100),
+        sectionHeader: currentHeader,
+      });
+    }
+  }
+
+  // Pass 2: Compute IDF across full paragraph corpus
+  const corpusTexts = corpus.map(c => c.text);
+  const idfWeights = computeIdf(corpusTexts, allUnigrams);
+
+  // Pass 3: Score each paragraph with IDF + bigrams + header boost
+  const allParagraphs: ScoredParagraph[] = [];
+
+  for (const item of corpus) {
+    const score = scoreParagraph(item.text, allUnigrams, allBigrams, idfWeights, item.sectionHeader);
+    if (score > 0) {
+      allParagraphs.push({
+        text: item.text,
+        score,
+        pageId: item.pageId,
+        pageTitle: item.pageTitle,
+        sectionHeader: item.sectionHeader,
+      });
     }
   }
 
@@ -76,19 +170,35 @@ export function extractAllRelevantParagraphs(pages: PageInfo[], query: string): 
 }
 
 export function selectRelevantParagraphs(
-  pages: PageInfo[], query: string, maxCount = 10
+  pages: PageInfo[],
+  query: string,
+  maxCount?: number,
+  extraKeywords?: { unigrams: string[]; bigrams: string[] }
 ): ScoredParagraph[] {
-  const allParagraphs = extractAllRelevantParagraphs(pages, query);
+  const hardCap = maxCount ?? 15;
+  const minCount = 3;
+
+  const allParagraphs = extractAllRelevantParagraphs(pages, query, extraKeywords);
 
   // Sort by relevance score (descending)
   allParagraphs.sort((a, b) => b.score - a.score);
 
-  // Deduplicate and collect top paragraphs
+  if (allParagraphs.length === 0) return [];
+
+  // Adaptive threshold: 40% of top score
+  const topScore = allParagraphs[0].score;
+  const threshold = topScore * 0.4;
+
+  // Deduplicate and collect paragraphs with adaptive cutoff
   const selectedTexts: string[] = [];
   const selected: ScoredParagraph[] = [];
 
   for (const para of allParagraphs) {
-    if (selected.length >= maxCount) break;
+    if (selected.length >= hardCap) break;
+
+    // Stop when score drops below threshold AND we have minimum count
+    if (para.score < threshold && selected.length >= minCount) break;
+
     if (isDuplicate(para.text, selectedTexts)) continue;
 
     selected.push(para);
@@ -99,13 +209,30 @@ export function selectRelevantParagraphs(
 }
 
 export function generateSummary(
-  query: string, pages: PageInfo[], preselected?: ScoredParagraph[]
+  query: string,
+  pages: PageInfo[],
+  preselected?: ScoredParagraph[],
+  expandedKeywords?: { unigrams: string[]; bigrams: string[] }
 ): string {
   const sections: string[] = [];
   const keywords = tokenizeQuery(query);
 
   sections.push(`# Research: ${query}\n`);
-  sections.push(`> Explored ${pages.length} pages | Keywords: ${keywords.join(", ")}\n`);
+
+  // Display expanded keywords/phrases in the summary header
+  const allTerms = [...keywords];
+  if (expandedKeywords) {
+    for (const u of expandedKeywords.unigrams) {
+      if (!allTerms.includes(u)) allTerms.push(u);
+    }
+  }
+  const phrases = expandedKeywords?.bigrams ?? [];
+
+  let headerLine = `> Explored ${pages.length} pages | Keywords: ${allTerms.join(", ")}`;
+  if (phrases.length > 0) {
+    headerLine += ` | Phrases: ${phrases.join(", ")}`;
+  }
+  sections.push(headerLine + "\n");
 
   const selected = preselected ?? selectRelevantParagraphs(pages, query);
 
@@ -130,7 +257,13 @@ export function generateSummary(
     sections.push(`## ${title}`);
     sections.push(`*Page ID: ${pageId} | ${paras.length} relevant sections*\n`);
 
+    let lastHeader: string | undefined;
     for (const para of paras) {
+      // Render section header before paragraphs (deduplicate consecutive same-header)
+      if (para.sectionHeader && para.sectionHeader !== lastHeader) {
+        sections.push(`### ${para.sectionHeader}\n`);
+        lastHeader = para.sectionHeader;
+      }
       sections.push(para.text);
       sections.push(""); // Empty line between paragraphs
     }

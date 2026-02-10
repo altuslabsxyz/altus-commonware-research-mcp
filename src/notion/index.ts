@@ -11,6 +11,8 @@ export {
 export {
   flattenPages,
   tokenizeQuery,
+  generateBigrams,
+  computeIdf,
   scoreParagraph,
   isDuplicate,
   extractAllRelevantParagraphs,

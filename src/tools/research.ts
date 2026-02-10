@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ROOT_PAGE_IDS } from "../config.js";
-import type { PageInfo } from "../types.js";
+import type { PageInfo, ScoredParagraph } from "../types.js";
 import { getSession } from "../oauth/index.js";
 import { getMcpSessionId } from "../utils/index.js";
 import {
@@ -117,6 +117,125 @@ Pick the IDs of pages you want to explore:`,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// AI Query Expansion via Elicitation
+// ─────────────────────────────────────────────────────────────────────────────
+async function expandQueryViaElicitation(
+  server: McpServer,
+  query: string
+): Promise<{ unigrams: string[]; bigrams: string[] }> {
+  const empty = { unigrams: [], bigrams: [] };
+
+  try {
+    const result = await server.server.elicitInput({
+      mode: "form",
+      message: `You are a domain expert on Commonware blockchain infrastructure, Reth, and distributed systems.
+
+Given the research query below, suggest additional search terms that would help find relevant content. Include:
+- Domain-specific synonyms (e.g., "consensus" → "agreement protocol")
+- Related component names (e.g., "actor pattern" → "mailbox, message passing")
+- Related architectural patterns or concepts
+
+Query: "${query}"
+
+Provide comma-separated terms. Single words and multi-word phrases are both welcome.`,
+      requestedSchema: {
+        type: "object",
+        properties: {
+          terms: {
+            type: "string",
+            description: "Comma-separated additional search terms",
+          },
+        },
+        required: ["terms"],
+      },
+    });
+
+    if (result.action === "accept" && result.content && typeof (result.content as any).terms === "string") {
+      const raw = (result.content as any).terms as string;
+      const terms = raw.split(",").map((t: string) => t.trim().toLowerCase()).filter(Boolean);
+
+      const unigrams: string[] = [];
+      const bigrams: string[] = [];
+
+      for (const term of terms) {
+        const words = term.split(/\s+/).filter(w => w.length >= 3);
+        if (words.length >= 2) {
+          bigrams.push(term);
+          // Also add constituent words as unigrams
+          for (const w of words) {
+            if (!unigrams.includes(w)) unigrams.push(w);
+          }
+        } else if (words.length === 1) {
+          if (!unigrams.includes(words[0])) unigrams.push(words[0]);
+        }
+      }
+
+      return { unigrams, bigrams };
+    }
+  } catch {
+    // Fallback: no expansion
+  }
+
+  return empty;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AI Re-ranking via Elicitation
+// ─────────────────────────────────────────────────────────────────────────────
+async function rerankViaElicitation(
+  server: McpServer,
+  query: string,
+  paragraphs: ScoredParagraph[]
+): Promise<ScoredParagraph[]> {
+  if (paragraphs.length <= 2) return paragraphs;
+
+  try {
+    const excerpts = paragraphs.map((p, i) => {
+      const truncated = p.text.length > 200 ? p.text.substring(0, 200) + "..." : p.text;
+      return `${i}. [${p.pageTitle}] ${truncated}`;
+    });
+
+    const indices = paragraphs.map((_, i) => String(i));
+
+    const result = await server.server.elicitInput({
+      mode: "form",
+      message: `Given the research query, select the paragraph indices that are semantically relevant to answering it. Remove paragraphs that are off-topic or only tangentially related.
+
+Query: "${query}"
+
+Paragraphs:
+${excerpts.join("\n\n")}
+
+Select the indices of relevant paragraphs:`,
+      requestedSchema: {
+        type: "object",
+        properties: {
+          indices: {
+            type: "array",
+            items: { type: "string", enum: indices },
+            minItems: 0,
+          },
+        },
+        required: ["indices"],
+      },
+    });
+
+    if (result.action === "accept" && result.content && Array.isArray((result.content as any).indices)) {
+      const selectedIndices = ((result.content as any).indices as string[]).map(Number).filter(n => !isNaN(n) && n >= 0 && n < paragraphs.length);
+
+      // Fallback if AI selects zero
+      if (selectedIndices.length === 0) return paragraphs;
+
+      return selectedIndices.map(i => paragraphs[i]);
+    }
+  } catch {
+    // Fallback: return original array
+  }
+
+  return paragraphs;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Research Tool
 // ─────────────────────────────────────────────────────────────────────────────
 export function registerResearchTool(server: McpServer): void {
@@ -189,9 +308,17 @@ IMPORTANT: If authorization is required, wait for the user to complete it. Do NO
     // Flatten all pages (intermediate + leaf) into a single list
     const allPages = flattenPages(results);
 
-    // Select relevant paragraphs, then generate formatted summary
-    const selected = selectRelevantParagraphs(allPages, query);
-    const summary = generateSummary(query, allPages, selected);
+    // AI query expansion: get additional domain-specific terms
+    const expandedKeywords = await expandQueryViaElicitation(server, query);
+
+    // Select relevant paragraphs with IDF + bigrams + header boost + adaptive threshold
+    const selectedParagraphs = selectRelevantParagraphs(allPages, query, undefined, expandedKeywords);
+
+    // AI re-ranking: semantic filtering of selected paragraphs
+    const reranked = await rerankViaElicitation(server, query, selectedParagraphs);
+
+    // Generate formatted summary with section headers and expanded keywords
+    const summary = generateSummary(query, allPages, reranked, expandedKeywords);
 
     const altusContext = `## Altus Research Advisor Context
 
