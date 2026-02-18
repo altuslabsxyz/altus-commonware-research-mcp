@@ -9,21 +9,15 @@ const FILE_DIR = dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: resolve(FILE_DIR, "..", ".env") });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Configuration
+// NotebookLM Configuration
 // ─────────────────────────────────────────────────────────────────────────────
-export const NOTION_BASE = (process.env.NOTION_MCP_URL ?? "https://mcp.notion.com").replace(/\/(mcp|sse)$/, "");
-
-// Cloud Run provides PORT, default to 3100 for local
-export const MCP_PORT = parseInt(process.env.PORT ?? "3100", 10);
-
-// For Cloud Run, we need the public URL
-export const OAUTH_CALLBACK_URL = process.env.OAUTH_CALLBACK_URL ?? `http://localhost:${MCP_PORT}/callback`;
-
-export const ROOT_PAGE_IDS = (process.env.NOTION_PAGE_IDS ?? "").split(",").map(s => s.trim()).filter(Boolean);
+export const NOTEBOOK_ID = process.env.NOTEBOOK_ID ?? "";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Constants
+// GitHub Configuration
 // ─────────────────────────────────────────────────────────────────────────────
-export const OAUTH_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
-export const TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000; // 5 minutes before expiry
+export const GITHUB_TOKEN = process.env.GITHUB_TOKEN ?? "";
 
+export const REFERENCE_REPOS: readonly string[] = (
+  process.env.REFERENCE_REPOS ?? ""
+).split(",").map(r => r.trim()).filter(Boolean);

@@ -1,14 +1,17 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { registerAuthorizeTool } from "./authorize.js";
-import { registerResearchTool } from "./research.js";
-import { registerGetPageTool } from "./get-page.js";
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Register All Tools
-// ─────────────────────────────────────────────────────────────────────────────
+import { registerLoginTool, registerRefreshAuthTool } from "./setup-auth.js";
+import { registerQueryTool } from "./query.js";
+import { registerSearchImplementationTool } from "./implementation.js";
+import { registerSuggestionTool } from "./suggestion.js";
+import { registerFactCheckTool } from "./factcheck.js";
+import { registerSelectRepositoriesTool } from "./repo-selection.js";
 
 export function registerTools(server: McpServer): void {
-  registerAuthorizeTool(server);
-  registerResearchTool(server);
-  registerGetPageTool(server);
+  registerLoginTool(server);
+  registerRefreshAuthTool(server);
+  registerQueryTool(server);
+  registerSearchImplementationTool(server);
+  registerSuggestionTool(server);
+  registerFactCheckTool(server);
+  registerSelectRepositoriesTool(server);
 }
