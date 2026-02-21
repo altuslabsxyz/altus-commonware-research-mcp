@@ -233,7 +233,7 @@ function treeCacheKey(repo: string): string {
  * Uses Git Trees API with `?recursive=1` — one API call returns everything.
  * Cached in memory after first fetch.
  */
-async function getTree(repo: string, ref?: string): Promise<TreeEntry[]> {
+export async function getTree(repo: string, ref?: string): Promise<TreeEntry[]> {
   void ref; // main-only retrieval policy
   const memKey = treeCacheKey(repo);
   const cached = treeCache.get(memKey);
@@ -278,7 +278,7 @@ export function preloadTrees(): void {
  * Fetch a file from raw.githubusercontent.com.
  * No auth needed, no rate limit for public repos.
  */
-async function fetchRawFile(repo: string, path: string, ref?: string): Promise<string | null> {
+export async function fetchRawFile(repo: string, path: string, ref?: string): Promise<string | null> {
   try {
     void ref; // main-only retrieval policy
     const refKey = MAIN_BRANCH;
