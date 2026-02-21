@@ -1,942 +1,325 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import {
-  analyzeRepoFlow,
   searchRepos,
+  fetchRawFile,
+  fetchRepoContext,
+  getTree,
   validateRepos,
-  type FlowAnalysisResult,
-  type SearchMatch,
+  inferLanguage,
+  type TreeEntry,
 } from "../github/index.js";
 import { REFERENCE_REPOS } from "../config.js";
-import { askNotebookLm } from "../notebooklm/index.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Claim extraction and retrieval planning
+// Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-interface Claim {
-  id: number;
-  text: string;
-  keywords: string[];
-}
+const MAX_TREE_PATHS = 800;
+const MAX_ITEMS = 20;
+const MAX_CONCURRENCY = 3;
+const MAX_SEARCH_MATCHES_PER_ITEM = 4;
+const MAX_FILE_CHARS = 12000;
+const MAX_SNIPPET_CHARS = 1800;
+const MAX_FILE_PATHS_PER_ITEM = 6;
 
-type ClaimBucket = "fact" | "flow" | "component";
+// Source file extensions to include in the tree listing for the client AI.
+const SOURCE_EXTENSIONS = new Set([
+  ".rs", ".toml", ".ts", ".js", ".go", ".py", ".sol", ".md",
+  ".json", ".yaml", ".yml", ".lock",
+]);
 
-interface ValidationItem extends Claim {
-  bucket: ClaimBucket;
-  requiredStaticEvidence: number;
-  requiredFlowEvidence: number;
-  selectedRepo: string;
-  comparisonGroup?: string;
-}
-
-interface ClientValidationItemInput {
-  text: string;
-  bucket?: string;
-  keywords?: string[];
-  selected_repo?: string;
-  comparison_group?: string;
-}
-
-const MAX_CLAIMS = 12;
-const MAX_MATCHES_PER_CLAIM = 2;
-const MAX_EVIDENCE_ITEMS = 8;
-const MAX_EVIDENCE_SNIPPET_CHARS = 900;
-const MAX_FLOW_ITEMS = 12;
-const MAX_RESPONSE_BYTES = 14000;
-const MAX_CONTRADICTION_SNIPPET_CHARS = 520;
-const MAX_CONTRADICTION_ITEMS = 12;
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
 function truncate(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text;
   return `${text.slice(0, maxChars)}\n\n...(truncated)`;
 }
 
-function truncateInline(text: string, maxChars: number): string {
-  const compact = text.replace(/\s+/g, " ").trim();
-  if (compact.length <= maxChars) return compact;
-  return `${compact.slice(0, maxChars)}...`;
-}
-
-function cleanClaimText(text: string): string {
-  return text
-    .replace(/\*\*/g, "")
-    .replace(/`/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function normalizeBucket(bucket: string | undefined): ClaimBucket {
-  if (!bucket) return "fact";
-  const normalized = bucket.trim().toLowerCase();
-  if (normalized === "flow" || normalized === "component" || normalized === "fact") {
-    return normalized;
-  }
-
-  // Accept common user-facing labels without forcing strict enums.
-  if (
-    normalized.includes("flow") ||
-    normalized.includes("sequence") ||
-    normalized.includes("lifecycle") ||
-    normalized.includes("call tree") ||
-    normalized.includes("logic")
-  ) {
-    return "flow";
-  }
-
-  if (
-    normalized.includes("architecture") ||
-    normalized.includes("component") ||
-    normalized.includes("module") ||
-    normalized.includes("diagram") ||
-    normalized.includes("topology")
-  ) {
-    return "component";
-  }
-
-  if (
-    normalized.includes("data model") ||
-    normalized.includes("schema") ||
-    normalized.includes("fact")
-  ) {
-    return "fact";
-  }
-
-  return "fact";
-}
-
-function normalizeKeywords(keywords: readonly string[] | undefined): string[] {
-  if (!keywords?.length) return [];
-  const out = keywords
-    .map(k => k.trim().toLowerCase())
-    .filter(Boolean);
-  return [...new Set(out)].slice(0, 8);
-}
-
-interface AiPlanItem {
-  text?: string;
-  selected_repo?: string;
-  bucket?: string;
-  keywords?: string[];
-  comparison_group?: string;
-}
-
-interface AiPlanResult {
-  items?: AiPlanItem[];
-  notes?: string[];
-}
-
-function extractJsonObject(raw: string): string | null {
-  const fenced = raw.match(/```json\s*([\s\S]*?)```/i);
-  if (fenced?.[1]) return fenced[1].trim();
-  const first = raw.indexOf("{");
-  const last = raw.lastIndexOf("}");
-  if (first >= 0 && last > first) {
-    return raw.slice(first, last + 1).trim();
-  }
-  return null;
-}
-
-function parseAiPlan(raw: string): AiPlanResult | null {
-  const candidate = extractJsonObject(raw);
-  if (!candidate) return null;
-  try {
-    return JSON.parse(candidate) as AiPlanResult;
-  } catch {
-    return null;
-  }
-}
-
-function buildAiPlanningPrompt(sourceText: string, candidateRepos: readonly string[]): string {
-  return [
-    "You are planning fact-check validation items for code verification.",
-    "Given the document/claims and the allowed repositories, output ONLY JSON.",
-    "Rules:",
-    "- Choose concrete technical items to validate (max 12).",
-    "- Map each item to exactly one selected_repo from allowed list.",
-    "- Provide bucket as one of: fact, flow, component.",
-    "- Provide keywords for code retrieval (2-8 concise technical terms).",
-    "- Comparative claims MUST be split into separate single-repo items sharing the same comparison_group id.",
-    "",
-    `Allowed repositories: ${candidateRepos.join(", ")}`,
-    "",
-    "JSON schema:",
-    "{",
-    '  "items": [',
-    '    {"text":"...", "selected_repo":"...", "bucket":"fact|flow|component", "keywords":["..."], "comparison_group":"optional"}',
-    "  ],",
-    '  "notes": ["optional planning notes"]',
-    "}",
-    "",
-    "Document/claims to plan:",
-    sourceText,
-  ].join("\n");
-}
-
-async function planValidationItemsWithAi(
-  sourceText: string,
-  candidateRepos: readonly string[],
-): Promise<{ items: ValidationItem[]; notes: string[]; raw: string }> {
-  const prompt = buildAiPlanningPrompt(sourceText, candidateRepos);
-  const raw = await askNotebookLm(prompt);
-  const parsed = parseAiPlan(raw);
-  const notes = parsed?.notes?.filter(Boolean) ?? [];
-  const inputItems = parsed?.items ?? [];
-  const items: ValidationItem[] = [];
-
-  for (const entry of inputItems) {
-    if (items.length >= MAX_CLAIMS) break;
-    const text = cleanClaimText(entry.text ?? "");
-    if (!text) continue;
-    const selectedRepo = (entry.selected_repo ?? "").trim();
-    if (!selectedRepo || !candidateRepos.includes(selectedRepo)) continue;
-    const keywords = normalizeKeywords(entry.keywords);
-    if (keywords.length === 0) continue;
-    const bucket = normalizeBucket(entry.bucket);
-    items.push({
-      id: items.length + 1,
-      text,
-      keywords,
-      bucket,
-      requiredStaticEvidence: 1,
-      requiredFlowEvidence: bucket === "flow" ? 1 : 0,
-      selectedRepo,
-      comparisonGroup: entry.comparison_group?.trim() || undefined,
-    });
-  }
-
-  return { items, notes, raw };
-}
-
-function normalizeClientValidationItems(
-  items: readonly ClientValidationItemInput[],
-  targetRepos: readonly string[],
-): ValidationItem[] {
-  const normalized: ValidationItem[] = [];
-  const seen = new Set<string>();
-
-  for (const raw of items) {
-    const cleanedText = cleanClaimText(raw.text ?? "");
-    if (!cleanedText) continue;
-    const key = [
-      cleanedText.toLowerCase(),
-      (raw.selected_repo ?? "").toLowerCase(),
-      (raw.comparison_group ?? "").toLowerCase(),
-    ].join("::");
-    if (seen.has(key)) continue;
-    seen.add(key);
-
-    const inferredBucket = normalizeBucket(raw.bucket);
-    const itemKeywords = normalizeKeywords(raw.keywords);
-
-    let selectedRepo = raw.selected_repo?.trim();
-    if (
-      selectedRepo &&
-      (!REFERENCE_REPOS.includes(selectedRepo) || !targetRepos.includes(selectedRepo))
-    ) {
-      selectedRepo = undefined;
+function filterTree(entries: readonly TreeEntry[]): string[] {
+  const paths: string[] = [];
+  for (const entry of entries) {
+    const dotIdx = entry.path.lastIndexOf(".");
+    if (dotIdx < 0) continue;
+    const ext = entry.path.slice(dotIdx);
+    if (SOURCE_EXTENSIONS.has(ext)) {
+      paths.push(entry.path);
     }
-    if (!selectedRepo) {
-      selectedRepo = targetRepos[0] ?? REFERENCE_REPOS[0];
-    }
-
-    normalized.push({
-      id: normalized.length + 1,
-      text: cleanedText,
-      keywords: itemKeywords,
-      bucket: inferredBucket,
-      requiredStaticEvidence: 1,
-      requiredFlowEvidence: inferredBucket === "flow" ? 1 : 0,
-      selectedRepo,
-      comparisonGroup: raw.comparison_group?.trim() || undefined,
-    });
-
-    if (normalized.length >= MAX_CLAIMS) break;
+    if (paths.length >= MAX_TREE_PATHS) break;
   }
-
-  return normalized;
+  return paths;
 }
 
-function matchKey(match: SearchMatch): string {
-  return `${match.repo}:${match.path}`;
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// Planning prompt — embedded in tool response for client AI
+// ─────────────────────────────────────────────────────────────────────────────
 
-function claimEvidenceScore(claim: Claim, match: SearchMatch): number {
-  const haystack = `${match.path}\n${match.snippet}`.toLowerCase();
-  let score = 0;
-
-  for (const kw of claim.keywords) {
-    const lower = kw.toLowerCase();
-    if (haystack.includes(lower)) score += 3;
-  }
-
-  if (match.path.toLowerCase().includes("main")) score += 1;
-  if (match.path.toLowerCase().includes("rpc")) score += 1;
-
-  return score;
-}
-
-interface FlowCatalogItem {
-  id: string;
-  keyword: string;
-  chain: string;
-}
-
-interface FlowChain {
-  keyword: string;
-  chain: string;
-}
-
-interface ClaimRetrievalResult {
-  item: ValidationItem;
-  searchedKeywords: string[];
-  staticMatches: SearchMatch[];
-  flowChains: FlowChain[];
-  filesAnalyzed: number;
-  symbolsIndexed: number;
-  edgesIndexed: number;
-  repoErrors: string[];
-}
-
-interface ComparisonAggregate {
-  group: string;
-  itemIds: number[];
-  repos: string[];
-  status: VerificationStatus;
-  confidence: VerificationConfidence;
-  reason: string;
-}
-
-type ContradictionVerdict = "contradicted" | "supported" | "insufficient";
-
-interface ContradictionSignal {
-  verdict: ContradictionVerdict;
-  reason: string;
-}
-
-interface AiContradictionItem {
-  id?: number;
-  verdict?: string;
-  reason?: string;
-}
-
-interface AiContradictionResponse {
-  items?: AiContradictionItem[];
-}
-
-function extractFlowChains(flow: FlowAnalysisResult | null): FlowChain[] {
-  if (!flow) return [];
-  const dedup = new Set<string>();
-  const items: FlowChain[] = [];
-  for (const group of flow.keywordChains) {
-    for (const chain of group.chains) {
-      const normalized = chain.trim();
-      if (!normalized) continue;
-      const key = `${group.keyword.toLowerCase()}::${normalized.toLowerCase()}`;
-      if (dedup.has(key)) continue;
-      dedup.add(key);
-      items.push({ keyword: group.keyword, chain: normalized });
-      if (items.length >= MAX_FLOW_ITEMS) return items;
-    }
-  }
-  return items;
-}
-
-function compactForAi(text: string, maxChars: number): string {
-  const stripped = text
-    .replace(/```[a-zA-Z0-9_-]*\n?/g, "")
-    .replace(/```/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (stripped.length <= maxChars) return stripped;
-  return `${stripped.slice(0, maxChars)}...`;
-}
-
-function normalizeContradictionVerdict(v: string | undefined): ContradictionVerdict {
-  const lower = (v ?? "").trim().toLowerCase();
-  if (lower === "contradicted" || lower === "contradiction") return "contradicted";
-  if (lower === "supported" || lower === "verified") return "supported";
-  return "insufficient";
-}
-
-function parseAiContradictionResponse(raw: string): AiContradictionResponse | null {
-  const fenced = raw.match(/```json\s*([\s\S]*?)```/i);
-  const candidate = fenced?.[1]?.trim() ?? raw;
-  const first = candidate.indexOf("{");
-  const last = candidate.lastIndexOf("}");
-  const jsonText = first >= 0 && last > first ? candidate.slice(first, last + 1) : candidate;
-  try {
-    return JSON.parse(jsonText) as AiContradictionResponse;
-  } catch {
-    return null;
-  }
-}
-
-function buildContradictionPrompt(retrievals: readonly ClaimRetrievalResult[]): string {
-  const payload = retrievals.slice(0, MAX_CONTRADICTION_ITEMS).map(r => ({
-    id: r.item.id,
-    claim: r.item.text,
-    repo: r.item.selectedRepo,
-    bucket: r.item.bucket,
-    static_evidence: r.staticMatches.slice(0, 2).map(m => ({
-      path: `${m.repo}/${m.path}`,
-      snippet: compactForAi(m.snippet, MAX_CONTRADICTION_SNIPPET_CHARS),
-    })),
-    flow_evidence: r.flowChains.slice(0, 3).map(c => `${c.keyword}: ${c.chain}`),
-  }));
-
-  return [
-    "You are checking whether each claim is contradicted by provided code evidence.",
-    "Use only provided evidence. Do not use external knowledge.",
-    "Return ONLY JSON with schema:",
-    '{"items":[{"id":1,"verdict":"contradicted|supported|insufficient","reason":"short reason"}]}',
-    "Definitions:",
-    "- contradicted: evidence directly conflicts with claim.",
-    "- supported: evidence supports claim and no direct conflict is present.",
-    "- insufficient: evidence is not enough to decide support/contradiction.",
-    "Items:",
-    JSON.stringify(payload, null, 2),
-  ].join("\n");
-}
-
-async function detectContradictionsWithAi(
-  retrievals: readonly ClaimRetrievalResult[],
-): Promise<Map<number, ContradictionSignal>> {
-  const byId = new Map<number, ContradictionSignal>();
-  if (retrievals.length === 0) return byId;
-
-  try {
-    const raw = await askNotebookLm(buildContradictionPrompt(retrievals));
-    const parsed = parseAiContradictionResponse(raw);
-    for (const item of parsed?.items ?? []) {
-      if (typeof item.id !== "number") continue;
-      byId.set(item.id, {
-        verdict: normalizeContradictionVerdict(item.verdict),
-        reason: (item.reason ?? "").trim() || "No contradiction rationale provided.",
-      });
-    }
-  } catch {
-    // Best-effort signal; fallback is evidence-only scoring.
-  }
-
-  return byId;
-}
-
-function retrievalKeywordsForItem(
-  item: ValidationItem,
-  keywordHints: readonly string[],
-): string[] {
-  const fromClaim = normalizeKeywords(item.keywords);
-  const fromHints = normalizeKeywords(keywordHints);
-  const merged = [...fromClaim, ...fromHints];
-  return [...new Set(merged)].slice(0, 8);
-}
-
-async function retrieveClaimEvidence(
-  item: ValidationItem,
-  keywordHints: readonly string[],
-): Promise<ClaimRetrievalResult> {
-  const searchedKeywords = retrievalKeywordsForItem(item, keywordHints);
-  if (searchedKeywords.length === 0) {
-    return {
-      item,
-      searchedKeywords: [],
-      staticMatches: [],
-      flowChains: [],
-      filesAnalyzed: 0,
-      symbolsIndexed: 0,
-      edgesIndexed: 0,
-      repoErrors: ["No retrieval keywords were provided for this validation item."],
-    };
-  }
-  const searchResult = await searchRepos(
-    searchedKeywords,
-    [item.selectedRepo],
-    Math.max(4, MAX_MATCHES_PER_CLAIM * 2),
-  );
-  const rankedStatic = [...searchResult.matches]
-    .map(match => ({ match, score: claimEvidenceScore(item, match) }))
-    .sort((a, b) => b.score - a.score)
-    .slice(0, MAX_MATCHES_PER_CLAIM)
-    .map(x => x.match);
-
-  let flowResult: FlowAnalysisResult | null = null;
-  if (item.bucket === "flow") {
-    flowResult = await analyzeRepoFlow(searchedKeywords, [item.selectedRepo], 40).catch(() => null);
-  }
-
-  const flowChains = extractFlowChains(flowResult);
-
-  return {
-    item,
-    searchedKeywords,
-    staticMatches: rankedStatic,
-    flowChains,
-    filesAnalyzed: flowResult?.filesAnalyzed ?? 0,
-    symbolsIndexed: flowResult?.symbolsIndexed ?? 0,
-    edgesIndexed: flowResult?.edgesIndexed ?? 0,
-    repoErrors: [
-      ...(searchResult.repoErrors ?? []),
-      ...(flowResult?.repoErrors ?? []),
-    ],
-  };
-}
-
-type VerificationStatus = "Verified" | "Partially Verified" | "Not Verified" | "Contradicted" | "INSUFFICIENT_EVIDENCE";
-type VerificationConfidence = "High" | "Medium" | "Low";
-type ClaimCategory = "static" | "flow" | "concept" | "absence" | "comparative";
-
-interface ClaimAssessment {
-  category: ClaimCategory;
-  status: VerificationStatus;
-  confidence: VerificationConfidence;
-  reason: string;
-  fixHint: string;
-}
-
-function categorizeClaim(claim: Claim): ClaimCategory {
-  const lower = claim.text.toLowerCase();
-
-  if (
-    lower.includes(" vs ") ||
-    lower.includes("versus") ||
-    lower.includes("between ") ||
-    lower.includes("difference")
-  ) {
-    return "comparative";
-  }
-
-  if (
-    /\b(no|not|without|omitted|excluded|absent|does not|is not|are not)\b/.test(lower)
-  ) {
-    return "absence";
-  }
-
-  if (
-    /\b(performance|faster|latency|throughput|proof|correctness|guarantee|physical limits|bft)\b/.test(lower)
-  ) {
-    return "concept";
-  }
-
-  if (isFlowSensitiveClaim(claim)) {
-    return "flow";
-  }
-
-  return "static";
-}
-
-function isFlowSensitiveClaim(claim: Claim): boolean {
-  const lower = claim.text.toLowerCase();
-  const markers = [
-    "before", "after", "then", "while", "updates", "receives", "triggers",
-    "calls", "passes", "handler", "actor", "flow", "pipeline", "one-writer",
-    "many-readers", "shared", "wiring", "sequence",
-  ];
-  return markers.some(m => lower.includes(m));
-}
-
-function assessClaim(
-  item: ValidationItem,
-  evidenceRefs: readonly string[],
-  flowRefs: readonly string[],
-  repoCount: number,
-  contradiction: ContradictionSignal | undefined,
-): ClaimAssessment {
-  const category = categorizeClaim(item);
-  const hasStatic = evidenceRefs.length > 0;
-  const hasFlow = flowRefs.length > 0;
-  const needsFlow = isFlowSensitiveClaim(item);
-
-  if (contradiction?.verdict === "contradicted") {
-    return {
-      category,
-      status: "Contradicted",
-      confidence: "High",
-      reason: contradiction.reason,
-      fixHint: "Revise this claim to match the cited implementation evidence.",
-    };
-  }
-
-  if (
-    evidenceRefs.length < item.requiredStaticEvidence ||
-    flowRefs.length < item.requiredFlowEvidence
-  ) {
-    const reasonParts: string[] = [];
-    if (evidenceRefs.length < item.requiredStaticEvidence) {
-      reasonParts.push(
-        `static evidence ${evidenceRefs.length}/${item.requiredStaticEvidence}`,
-      );
-    }
-    if (flowRefs.length < item.requiredFlowEvidence) {
-      reasonParts.push(
-        `flow evidence ${flowRefs.length}/${item.requiredFlowEvidence}`,
-      );
-    }
-    return {
-      category,
-      status: "INSUFFICIENT_EVIDENCE",
-      confidence: "Low",
-      reason: `Required minimum evidence was not met (${reasonParts.join(", ")}).`,
-      fixHint: "Add targeted implementation claims/keywords or narrow repository scope to improve retrieval precision.",
-    };
-  }
-
-  if (category === "comparative" && repoCount < 2) {
-    return {
-      category,
-      status: hasStatic || hasFlow ? "Partially Verified" : "Not Verified",
-      confidence: "Low",
-      reason: "Comparative claim needs evidence from at least two repositories.",
-      fixHint: "Provide side-by-side citations from each compared repository.",
-    };
-  }
-
-  if (category === "absence") {
-    if (!hasStatic && !hasFlow) {
-      return {
-        category,
-        status: "Not Verified",
-        confidence: "Low",
-        reason: "Absence claim cannot be proven from current evidence set.",
-        fixHint: "Add explicit code/config references or scoped exclusion criteria.",
-      };
-    }
-
-    return {
-      category,
-      status: "Partially Verified",
-      confidence: "Medium",
-      reason: "Evidence supports the observed path, but global absence is not exhaustive.",
-      fixHint: "Rephrase as 'not found in inspected paths' unless exhaustive proof is provided.",
-    };
-  }
-
-  if (category === "concept") {
-    if (hasStatic && hasFlow) {
-      return {
-        category,
-        status: "Partially Verified",
-        confidence: "Medium",
-        reason: "Code flow supports implementation behavior, but conceptual claim exceeds direct proof.",
-        fixHint: "Downgrade to design intent or cite formal proof/benchmark artifacts.",
-      };
-    }
-    if (hasStatic || hasFlow) {
-      return {
-        category,
-        status: "Partially Verified",
-        confidence: "Low",
-        reason: "Only indirect implementation evidence exists for conceptual claim.",
-        fixHint: "Add explicit comments/docs/benchmarks proving this conceptual statement.",
-      };
-    }
-    return {
-      category,
-      status: "Not Verified",
-      confidence: "Low",
-      reason: "No direct implementation or flow evidence supports this conceptual claim.",
-      fixHint: "Remove claim or add benchmark/proof references.",
-    };
-  }
-
-  if (hasStatic && (!needsFlow || hasFlow)) {
-    return {
-      category,
-      status: "Verified",
-      confidence: hasFlow || !needsFlow ? "High" : "Medium",
-      reason: needsFlow
-        ? "Static evidence and flow chain are both present."
-        : "Static evidence directly supports this claim.",
-      fixHint: "No fix required.",
-    };
-  }
-
-  if (hasStatic || hasFlow) {
-    return {
-      category,
-      status: "Partially Verified",
-      confidence: "Medium",
-      reason: hasStatic
-        ? "Static evidence exists, but flow-level proof is incomplete."
-        : "Flow chain exists, but direct static declaration evidence is missing.",
-      fixHint: "Add missing static/flow evidence to fully verify this claim.",
-    };
-  }
-
-  return {
-    category,
-    status: "Not Verified",
-    confidence: "Low",
-    reason: "No direct static or flow evidence was retrieved for this claim.",
-    fixHint: "Add concrete code-level citations for this claim.",
-  };
-}
-
-function aggregateComparativeVerdicts(
-  assessments: Array<{
-    item: ValidationItem;
-    staticRefs: string[];
-    flowRefs: string[];
-    searchedKeywords: string[];
-    assessment: ClaimAssessment;
-  }>,
-): ComparisonAggregate[] {
-  const groups = new Map<string, typeof assessments>();
-  for (const entry of assessments) {
-    const group = entry.item.comparisonGroup;
-    if (!group) continue;
-    const list = groups.get(group);
-    if (!list) {
-      groups.set(group, [entry]);
-    } else {
-      list.push(entry);
-    }
-  }
-
-  const out: ComparisonAggregate[] = [];
-  for (const [group, entries] of groups) {
-    if (entries.length < 2) continue;
-    const statuses = entries.map(e => e.assessment.status);
-    let status: VerificationStatus;
-    let confidence: VerificationConfidence = "Low";
-    let reason = "Comparison requires valid evidence for each side.";
-
-    if (statuses.every(s => s === "Verified")) {
-      status = "Verified";
-      confidence = "High";
-      reason = "All comparative sides are verified with required evidence.";
-    } else if (statuses.some(s => s === "Contradicted")) {
-      status = "Contradicted";
-      confidence = "High";
-      reason = "At least one comparative side is contradicted by implementation evidence.";
-    } else if (statuses.some(s => s === "INSUFFICIENT_EVIDENCE")) {
-      status = "INSUFFICIENT_EVIDENCE";
-      confidence = "Low";
-      reason = "At least one comparative side lacks minimum required evidence.";
-    } else if (statuses.every(s => s === "Not Verified")) {
-      status = "Not Verified";
-      confidence = "Low";
-      reason = "All comparative sides are not verified.";
-    } else {
-      status = "Partially Verified";
-      confidence = "Medium";
-      reason = "Comparative sides have mixed verification outcomes.";
-    }
-
-    out.push({
-      group,
-      itemIds: entries.map(e => e.item.id),
-      repos: [...new Set(entries.map(e => e.item.selectedRepo))],
-      status,
-      confidence,
-      reason,
-    });
-  }
-  return out;
-}
-
-function buildResponse(
+function buildPlanningResponse(
   document: string,
-  items: readonly ValidationItem[],
-  targetRepos: readonly string[],
-  planningNotes: readonly string[],
-  retrievals: readonly ClaimRetrievalResult[],
-  contradictionById: ReadonlyMap<number, ContradictionSignal>,
-  planningMode: "client-planned" | "ai-planned",
+  repos: readonly string[],
+  repoSections: string[],
 ): string {
   const out: string[] = [];
-  const repoErrors = [...new Set(retrievals.flatMap(r => r.repoErrors))];
 
-  const evidenceScore = new Map<string, number>();
-  const evidenceByKey = new Map<string, SearchMatch>();
-  for (const retrieval of retrievals) {
-    for (const match of retrieval.staticMatches) {
-      const key = matchKey(match);
-      evidenceByKey.set(key, match);
-      evidenceScore.set(
-        key,
-        (evidenceScore.get(key) ?? 0) + claimEvidenceScore(retrieval.item, match),
-      );
-    }
-  }
-
-  const catalog = [...evidenceScore.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .map(([key]) => evidenceByKey.get(key))
-    .filter((m): m is SearchMatch => Boolean(m))
-    .slice(0, MAX_EVIDENCE_ITEMS);
-
-  const evidenceIdByKey = new Map<string, string>();
-  for (let i = 0; i < catalog.length; i++) {
-    evidenceIdByKey.set(matchKey(catalog[i]), `E${i + 1}`);
-  }
-
-  const flowCatalog: FlowCatalogItem[] = [];
-  const flowIdByKey = new Map<string, string>();
-  for (const retrieval of retrievals) {
-    for (const chain of retrieval.flowChains) {
-      const key = `${chain.keyword.toLowerCase()}::${chain.chain.toLowerCase()}`;
-      if (flowIdByKey.has(key)) continue;
-      const id = `F${flowCatalog.length + 1}`;
-      flowIdByKey.set(key, id);
-      flowCatalog.push({ id, keyword: chain.keyword, chain: chain.chain });
-      if (flowCatalog.length >= MAX_FLOW_ITEMS) break;
-    }
-    if (flowCatalog.length >= MAX_FLOW_ITEMS) break;
-  }
-
-  const assessments: Array<{
-    item: ValidationItem;
-    staticRefs: string[];
-    flowRefs: string[];
-    searchedKeywords: string[];
-    contradiction: ContradictionSignal | undefined;
-    assessment: ClaimAssessment;
-  }> = [];
-
-  for (const retrieval of retrievals) {
-    const staticRefs = retrieval.staticMatches
-      .map(match => evidenceIdByKey.get(matchKey(match)))
-      .filter((id): id is string => Boolean(id));
-
-    const flowRefs = retrieval.flowChains
-      .map(chain => flowIdByKey.get(`${chain.keyword.toLowerCase()}::${chain.chain.toLowerCase()}`))
-      .filter((id): id is string => Boolean(id))
-      .slice(0, 3);
-
-    const assessment = assessClaim(
-      retrieval.item,
-      staticRefs,
-      flowRefs,
-      targetRepos.length,
-      contradictionById.get(retrieval.item.id),
-    );
-
-    assessments.push({
-      item: retrieval.item,
-      staticRefs,
-      flowRefs,
-      searchedKeywords: retrieval.searchedKeywords,
-      contradiction: contradictionById.get(retrieval.item.id),
-      assessment,
-    });
-  }
-
-  const verifiedCount = assessments.filter(a => a.assessment.status === "Verified").length;
-  const partialCount = assessments.filter(a => a.assessment.status === "Partially Verified").length;
-  const notVerifiedCount = assessments.filter(a => a.assessment.status === "Not Verified").length;
-  const contradictedCount = assessments.filter(a => a.assessment.status === "Contradicted").length;
-  const insufficientCount = assessments.filter(a => a.assessment.status === "INSUFFICIENT_EVIDENCE").length;
-  const totalFilesAnalyzed = retrievals.reduce((sum, r) => sum + r.filesAnalyzed, 0);
-  const totalSymbols = retrievals.reduce((sum, r) => sum + r.symbolsIndexed, 0);
-  const totalEdges = retrievals.reduce((sum, r) => sum + r.edgesIndexed, 0);
-  const comparisons = aggregateComparativeVerdicts(assessments);
-
-  out.push("## Summary");
-  out.push(`- Scope: repos=${targetRepos.join(", ")}, branch=main.`);
-  out.push(`- Items evaluated: ${assessments.length} (Verified=${verifiedCount}, Partially Verified=${partialCount}, Not Verified=${notVerifiedCount}, Contradicted=${contradictedCount}, INSUFFICIENT_EVIDENCE=${insufficientCount}).`);
-  out.push(`- Flow coverage: files=${totalFilesAnalyzed}, symbols=${totalSymbols}, edges=${totalEdges}.`);
-
+  out.push("# Fact-Check Planning");
   out.push("");
-  out.push("## Stage 1: Repository Selection and Validation Items");
-  out.push(`- Validation planning mode: ${planningMode}.`);
-  out.push(`- Repo selection mode: ${planningMode === "client-planned" ? "client-provided" : "ai-planned"}.`);
-  if (planningNotes.length > 0) {
-    out.push("- Planning notes:");
-    for (const reason of planningNotes.slice(0, 6)) {
-      out.push(`  - ${reason}`);
-    }
-  }
-  out.push("- Validation items:");
-  for (const item of items) {
-    out.push(
-      `  - [${item.id}] repo=${item.selectedRepo}, bucket=${item.bucket}, minimum_evidence=(static:${item.requiredStaticEvidence}, flow:${item.requiredFlowEvidence})${item.comparisonGroup ? `, comparison_group=${item.comparisonGroup}` : ""} :: ${truncateInline(item.text, 170)}`,
-    );
-  }
-
+  out.push("You have been given a document and reference repositories.");
+  out.push("Your task is to analyze the document, extract items that can be validated against source code, and then call `factcheck_validate` to retrieve actual code evidence.");
   out.push("");
-  out.push("## Stage 2: Implementation Retrieval");
-  out.push("- Retrieval path: per-item retrieval using the same backend as `search_implementation` (`searchRepos`) plus flow reconstruction (`analyzeRepoFlow`) for flow items.");
-  for (const item of assessments) {
-    out.push(
-      `- Item ${item.item.id}: keywords=\`${item.searchedKeywords.join(" ")}\`, static=${item.staticRefs.length}, flow=${item.flowRefs.length}, contradiction=${item.contradiction?.verdict ?? "insufficient"}`,
-    );
-  }
-  if (repoErrors.length > 0) {
-    out.push("- Retrieval warnings:");
-    for (const err of repoErrors.slice(0, 12)) {
-      out.push(`  - ${err}`);
-    }
-  }
-
+  out.push("## CRITICAL CONSTRAINTS");
   out.push("");
-  out.push("## Stage 3: Fact Check Verdict");
-  out.push("| ID | Repo | Bucket | Claim (short) | Verdict | Contradiction Reason | Evidence | Flow | Confidence |");
-  out.push("|---|---|---|---|---|---|---|---|---|");
-  for (const item of assessments) {
-    const shortClaim = truncateInline(item.item.text, 64).replace(/\|/g, "/");
-    const e = item.staticRefs.length > 0 ? item.staticRefs.join(",") : "-";
-    const f = item.flowRefs.length > 0 ? item.flowRefs.join(",") : "-";
-    const contradictionReason = item.contradiction?.verdict === "contradicted"
-      ? truncateInline(item.contradiction.reason, 90).replace(/\|/g, "/")
-      : "-";
-    out.push(`| ${item.item.id} | ${item.item.selectedRepo} | ${item.item.bucket} | ${shortClaim} | ${item.assessment.status} | ${contradictionReason} | ${e} | ${f} | ${item.assessment.confidence} |`);
-  }
+  out.push("- **DO NOT** call `query`, `suggestion`, or any other tool that queries NotebookLM.");
+  out.push("- **DO NOT** search the internet, use web search, or fetch external URLs.");
+  out.push("- **ONLY** use `factcheck_validate` as your next tool call.");
+  out.push("- All evidence must come exclusively from the reference repository source code retrieved by `factcheck_validate`.");
+  out.push("");
+  out.push("## Instructions");
+  out.push("");
+  out.push("1. Read the document below carefully.");
+  out.push("2. Identify **specific technical claims** that can be verified by inspecting source code. Focus on:");
+  out.push("   - Statements about what code does or does not do");
+  out.push("   - Logic flows, call chains, execution sequences");
+  out.push("   - Component roles, struct/function existence and behavior");
+  out.push("   - Configuration defaults, data structures, type relationships");
+  out.push("   - Trust assumptions (what is trusted vs rebuilt/verified)");
+  out.push("3. For each item, determine:");
+  out.push("   - `text`: The exact claim to validate");
+  out.push("   - `repo`: Which repository to search (from the list below)");
+  out.push("   - `file_paths`: **(PREFERRED)** Specific file paths to fetch from the repo tree below. This is fast — direct file download, no search overhead.");
+  out.push("   - `keywords`: **(FALLBACK ONLY)** Use only when you cannot determine file paths. Keyword search is significantly slower (triggers GitHub API search + multiple file fetches).");
+  out.push("4. Skip claims that **cannot** be verified from code:");
+  out.push("   - Performance benchmarks / timing claims");
+  out.push("   - Design philosophy opinions");
+  out.push("   - Future plans or speculative statements");
+  out.push("   - Claims about external dependencies (e.g., MDBX internals) unless the wrapping code is in the repo");
+  out.push("");
+  out.push("## How to call the next tool");
+  out.push("");
+  out.push("After extracting items, call `factcheck_validate` with:");
+  out.push("```json");
+  out.push(JSON.stringify({
+    document: "<the original document text (or a condensed version)>",
+    items: [
+      {
+        text: "<claim to validate>",
+        repo: "<owner/repo>",
+        keywords: ["<search term 1>", "<search term 2>"],
+        file_paths: ["<optional/path/to/file.rs>"],
+      },
+    ],
+  }, null, 2));
+  out.push("```");
+  out.push("");
 
-  if (comparisons.length > 0) {
+  out.push("---");
+  out.push("");
+
+  out.push("## Available Repositories");
+  out.push("");
+  out.push(`Repositories: ${repos.join(", ")}`);
+  out.push("");
+
+  for (const section of repoSections) {
+    out.push(section);
     out.push("");
-    out.push("### Comparative Verdicts");
-    out.push("| Group | Repos | Sub-items | Combined Verdict | Confidence | Reason |");
-    out.push("|---|---|---|---|---|---|");
-    for (const comp of comparisons) {
-      out.push(`| ${comp.group} | ${comp.repos.join(", ")} | ${comp.itemIds.join(", ")} | ${comp.status} | ${comp.confidence} | ${truncateInline(comp.reason, 120).replace(/\|/g, "/")} |`);
-    }
   }
 
+  out.push("---");
   out.push("");
-  out.push("## Fixes Required");
-  const needsFix = assessments.filter(a => a.assessment.status !== "Verified");
-  if (needsFix.length === 0) {
-    out.push("1. No immediate corrections required from current evidence scope.");
-  } else {
-    for (let i = 0; i < needsFix.length; i++) {
-      const item = needsFix[i];
-      out.push(`${i + 1}. Claim: ${truncateInline(item.item.text, 200)}`);
-      out.push(`   Why it fails: ${item.assessment.reason}`);
-      out.push(`   Evidence refs: ${item.staticRefs.length > 0 ? item.staticRefs.join(", ") : "-"}${item.flowRefs.length > 0 ? ` | flow=${item.flowRefs.join(", ")}` : ""}`);
-      out.push(`   How to fix: ${item.assessment.fixHint}`);
-    }
-  }
 
+  out.push("## Document to Fact-Check");
   out.push("");
-  out.push("## Reasoning");
-  out.push(`- Static evidence: ${catalog.length} curated snippets were linked to claim-level items.`);
-  out.push(`- Flow evidence: ${flowCatalog.length} call-chain snippets were linked to flow items.`);
-  out.push("- Contradiction detection: AI adjudication is applied to claim + retrieved evidence to flag direct conflicts with implementation.");
-  out.push("- Minimum evidence policy: when required minimum static/flow evidence is missing, verdict is `INSUFFICIENT_EVIDENCE` (no fallback inference).");
+  out.push(document);
 
+  return out.join("\n");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Validation response — embedded in tool response for client AI
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface ItemEvidence {
+  text: string;
+  repo: string;
+  searchedKeywords: string[];
+  fetchedPaths: string[];
+  codeSnippets: Array<{ path: string; language: string; snippet: string }>;
+  flowChains: string[];
+  errors: string[];
+}
+
+function buildValidationResponse(
+  document: string,
+  evidence: readonly ItemEvidence[],
+): string {
+  const out: string[] = [];
+
+  out.push("# Fact-Check Validation");
   out.push("");
-  out.push("## Evidence Appendix");
-  out.push(`- Source document size: ${document.length} chars`);
-  if (catalog.length > 0) {
+  out.push("Below is each claim paired with the code evidence retrieved from the repository.");
+  out.push("Your task: validate each claim against its evidence and produce a final verdict.");
+  out.push("");
+  out.push("## CRITICAL CONSTRAINTS");
+  out.push("");
+  out.push("- **DO NOT** call `query`, `suggestion`, or any other tool that queries NotebookLM.");
+  out.push("- **DO NOT** search the internet, use web search, or fetch external URLs.");
+  out.push("- Base your verdicts **exclusively** on the code evidence provided below.");
+  out.push("- If the evidence is insufficient, verdict is NOT_VERIFIED — do not attempt to fill gaps from external sources.");
+  out.push("");
+  out.push("## Instructions");
+  out.push("");
+  out.push("For each item:");
+  out.push("1. Read the claim and the retrieved code evidence carefully.");
+  out.push("2. Determine a **validity level**:");
+  out.push("   - **VERIFIED**: Code directly and unambiguously confirms the claim.");
+  out.push("   - **PARTIALLY_VERIFIED**: Code partially supports the claim, but some aspects are unconfirmed or ambiguous.");
+  out.push("   - **NOT_VERIFIED**: No relevant evidence was found. Cannot confirm or deny.");
+  out.push("   - **CONTRADICTED**: Code directly contradicts what the claim states.");
+  out.push("   - **UNVERIFIABLE**: The claim requires information beyond what code inspection can provide (runtime behavior, performance, etc.).");
+  out.push("3. Provide a concise **reason** citing the specific code evidence (file path, function name, line) that supports your verdict.");
+  out.push("4. If the claim is wrong or misleading, explain **what the code actually does**.");
+  out.push("");
+  out.push("## Output Format");
+  out.push("");
+  out.push("Present your findings as a structured report with:");
+  out.push("1. A summary table (item #, claim excerpt, verdict, confidence)");
+  out.push("2. Detailed per-item analysis with evidence citations");
+  out.push("3. A final section listing corrections needed (if any)");
+  out.push("");
+  out.push("---");
+  out.push("");
+
+  for (let i = 0; i < evidence.length; i++) {
+    const item = evidence[i];
+    out.push(`## Item ${i + 1}: ${item.repo}`);
     out.push("");
-    out.push("### Static Evidence");
-    for (const match of catalog) {
-      const evidenceId = evidenceIdByKey.get(matchKey(match)) ?? "E?";
-      out.push(`#### ${evidenceId} — ${match.repo} — ${match.path}`);
-      out.push(truncate(match.snippet, MAX_EVIDENCE_SNIPPET_CHARS));
+    out.push(`**Claim:** ${item.text}`);
+    out.push("");
+
+    if (item.errors.length > 0) {
+      out.push("**Retrieval warnings:**");
+      for (const err of item.errors) {
+        out.push(`- ${err}`);
+      }
       out.push("");
     }
+
+    if (item.codeSnippets.length > 0) {
+      out.push("**Code evidence:**");
+      out.push("");
+      for (const snippet of item.codeSnippets) {
+        out.push(`### ${snippet.path}`);
+        out.push(snippet.snippet);
+        out.push("");
+      }
+    } else {
+      out.push("**Code evidence:** No matching code found.");
+      out.push("");
+    }
+
+    if (item.flowChains.length > 0) {
+      out.push("**Call-chain evidence:**");
+      for (const chain of item.flowChains) {
+        out.push(`- ${chain}`);
+      }
+      out.push("");
+    }
+
+    if (item.fetchedPaths.length > 0 && item.codeSnippets.length === 0) {
+      out.push(`**Fetched files (no match):** ${item.fetchedPaths.join(", ")}`);
+      out.push("");
+    }
+
+    out.push("---");
+    out.push("");
   }
 
-  if (flowCatalog.length > 0) {
-    out.push("### Flow Evidence");
-    for (const item of flowCatalog) {
-      out.push(`- ${item.id} [keyword=${item.keyword}] ${item.chain}`);
-    }
+  if (document) {
+    out.push("## Original Document (for reference)");
+    out.push("");
+    out.push(truncate(document, 6000));
   }
 
   return out.join("\n");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Evidence retrieval per item
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface ValidationItemInput {
+  text: string;
+  repo: string;
+  keywords?: string[];
+  file_paths?: string[];
+}
+
+async function retrieveEvidence(item: ValidationItemInput): Promise<ItemEvidence> {
+  const keywords = (item.keywords ?? []).map(k => k.trim()).filter(Boolean);
+  const filePaths = (item.file_paths ?? []).map(p => p.trim()).filter(Boolean).slice(0, MAX_FILE_PATHS_PER_ITEM);
+  const errors: string[] = [];
+  const codeSnippets: ItemEvidence["codeSnippets"] = [];
+  const flowChains: string[] = [];
+  const fetchedPaths: string[] = [];
+
+  // Strategy 1: Direct file fetch — fast, no search overhead.
+  // Preferred when the client AI specifies exact paths from the repo tree.
+  if (filePaths.length > 0) {
+    const fetches = filePaths.map(async (path) => {
+      try {
+        const content = await fetchRawFile(item.repo, path);
+        fetchedPaths.push(path);
+        if (content) {
+          const lang = inferLanguage(path);
+          codeSnippets.push({
+            path: `${item.repo}/${path}`,
+            language: lang,
+            snippet: truncate(content, MAX_FILE_CHARS),
+          });
+        }
+      } catch {
+        errors.push(`Failed to fetch ${path}`);
+      }
+    });
+    await Promise.all(fetches);
+  }
+
+  // Strategy 2: Keyword search — only when no file_paths are given.
+  // searchRepos is expensive (Code Search API + up to 25 raw file fetches),
+  // so we skip it when direct paths already provide evidence.
+  if (filePaths.length === 0 && keywords.length > 0) {
+    try {
+      const result = await searchRepos(keywords, [item.repo], MAX_SEARCH_MATCHES_PER_ITEM);
+      for (const match of result.matches) {
+        codeSnippets.push({
+          path: `${match.repo}/${match.path}`,
+          language: match.language,
+          snippet: truncate(match.snippet, MAX_SNIPPET_CHARS),
+        });
+      }
+      if (result.repoErrors?.length) {
+        errors.push(...result.repoErrors);
+      }
+    } catch (e) {
+      errors.push(`Search failed: ${String(e)}`);
+    }
+  }
+
+  if (keywords.length === 0 && filePaths.length === 0) {
+    errors.push("No keywords or file_paths provided — cannot retrieve evidence.");
+  }
+
+  return {
+    text: item.text,
+    repo: item.repo,
+    searchedKeywords: keywords,
+    fetchedPaths,
+    codeSnippets,
+    flowChains,
+    errors,
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -946,51 +329,39 @@ function buildResponse(
 export function registerFactCheckTool(server: McpServer): void {
   const repoList = REFERENCE_REPOS.join(", ");
 
+  // ── Stage 1: Planning ──────────────────────────────────────────────────────
+
   server.registerTool("factcheck", {
-    title: "FactCheck",
+    title: "FactCheck — Plan",
     description:
-      `Validate a document against actual code in reference repos (${repoList}). ` +
-      "Pipeline: (1) AI plans validation items (fact/flow/component) with explicit per-item repo mapping, " +
-      "(2) retrieve per-item implementation evidence with search backend and call-chain analysis, " +
-      "(3) detect contradiction between claims and code evidence, then emit verdicts with strict minimum evidence thresholds.\n\n" +
-      "If `repos` is omitted, AI can choose from all REFERENCE_REPOS. " +
-      "Repository retrieval is pinned to the `main` branch only. " +
-      "When minimum evidence is not met, verdict is `INSUFFICIENT_EVIDENCE`. " +
-      "For best latency/control, pass `validation_items` directly from client planning.",
+      "Stage 1 of fact-checking: analyzes a document against reference repositories.\n\n" +
+      "Returns the document, repository context (README + source file tree), and instructions " +
+      "for you (the AI) to extract validation items. After analyzing, call `factcheck_validate` " +
+      "with the items you identified.\n\n" +
+      "IMPORTANT: This is a closed-loop pipeline. Do NOT call `query`, `suggestion`, or any " +
+      "NotebookLM-backed tool during fact-checking. Do NOT use web search or fetch external URLs. " +
+      "All evidence must come from `factcheck_validate` only.\n\n" +
+      `Available repositories: ${repoList}`,
     inputSchema: {
-      document: z.string().optional().describe(
-        "The document or text to fact-check."
+      document: z.string().describe(
+        "The document or text to fact-check against source code.",
       ),
       claims: z.array(z.string()).optional().describe(
-        "Optional explicit claims to append to the planning input."
-      ),
-      validation_items: z.array(z.object({
-        text: z.string(),
-        bucket: z.string().optional(),
-        keywords: z.array(z.string()).optional(),
-        selected_repo: z.string().optional(),
-        comparison_group: z.string().optional(),
-      })).optional().describe(
-        "Preferred fast path: client-planned validation items. If provided, the tool skips document claim extraction. Each item should map to one `selected_repo`."
-      ),
-      keywords: z.array(z.string()).optional().describe(
-        "Optional hint keywords. Usually not required."
+        "Optional explicit claims to append to the document for validation.",
       ),
       repos: z.array(z.string()).optional().describe(
-        `Optional allowed-repo subset for AI planning. If omitted, all are allowed: ${repoList}`
+        `Optional repository subset. If omitted, all are available: ${repoList}`,
       ),
     },
-  }, async ({ document, claims: explicitClaims, validation_items, keywords, repos }) => {
+  }, async ({ document, claims, repos }) => {
     const effectiveDocument = (document ?? "").trim();
-    const explicitClaimText = (explicitClaims ?? [])
-      .map(c => cleanClaimText(c))
-      .filter(Boolean);
+    const explicitClaims = (claims ?? []).map(c => c.trim()).filter(Boolean);
 
-    if (!effectiveDocument && explicitClaimText.length === 0 && (validation_items?.length ?? 0) === 0) {
+    if (!effectiveDocument && explicitClaims.length === 0) {
       return {
         content: [{
           type: "text" as const,
-          text: "No validation target provided. Supply `document` or `claims`, or provide non-empty `validation_items`.",
+          text: "No document or claims provided. Supply a `document` to fact-check.",
         }],
       };
     }
@@ -998,80 +369,136 @@ export function registerFactCheckTool(server: McpServer): void {
     const candidateRepos = repos?.length ? [...repos] : [...REFERENCE_REPOS];
     validateRepos(candidateRepos);
 
-    const keywordHints = normalizeKeywords(keywords ?? []);
-    const plannedItems = validation_items?.length
-      ? normalizeClientValidationItems(validation_items, candidateRepos)
-      : [];
-    let validationItems = plannedItems;
-    let planningNotes: string[] = [];
+    // Build full input text
+    const docParts: string[] = [];
+    if (effectiveDocument) docParts.push(effectiveDocument);
+    if (explicitClaims.length > 0) {
+      docParts.push("\n\n### Additional Claims\n");
+      docParts.push(explicitClaims.map((c, i) => `${i + 1}. ${c}`).join("\n"));
+    }
+    const fullDocument = docParts.join("\n");
 
-    if (validationItems.length === 0) {
-      const planningInput = [
-        effectiveDocument ? `Document:\n${effectiveDocument}` : "",
-        explicitClaimText.length > 0 ? `Claims:\n${explicitClaimText.map((c, i) => `${i + 1}. ${c}`).join("\n")}` : "",
-      ].filter(Boolean).join("\n\n");
+    // Fetch repo context and tree in parallel for each repo
+    const repoSections: string[] = [];
+    const repoFetches = candidateRepos.map(async (repo) => {
+      const [context, tree] = await Promise.allSettled([
+        fetchRepoContext(repo),
+        getTree(repo),
+      ]);
 
-      const aiPlan = await planValidationItemsWithAi(planningInput, candidateRepos);
-      validationItems = aiPlan.items;
-      planningNotes = aiPlan.notes;
+      const section: string[] = [];
+      section.push(`### ${repo}`);
 
-      if (validationItems.length === 0) {
-        return {
-          content: [{
-            type: "text" as const,
-            text: [
-              "AI planning failed to produce actionable validation items.",
-              "Ensure the document/claims include concrete technical statements and try again.",
-              `Planner raw output (truncated): ${truncateInline(aiPlan.raw, 1200)}`,
-            ].join("\n"),
-          }],
-        };
+      if (context.status === "fulfilled" && context.value.summary) {
+        section.push("");
+        section.push("**Context:**");
+        section.push(truncate(context.value.summary, 2000));
       }
-    }
 
-    const targetRepos = [...new Set(validationItems.map(i => i.selectedRepo))];
-    if (targetRepos.length === 0) {
+      if (tree.status === "fulfilled") {
+        const filtered = filterTree(tree.value);
+        section.push("");
+        section.push(`**Source tree** (${filtered.length} files, filtered from ${tree.value.length} total):`);
+        section.push("```");
+        section.push(filtered.join("\n"));
+        section.push("```");
+      }
+
+      return section.join("\n");
+    });
+
+    const results = await Promise.all(repoFetches);
+    repoSections.push(...results);
+
+    const text = buildPlanningResponse(fullDocument, candidateRepos, repoSections);
+    return { content: [{ type: "text" as const, text }] };
+  });
+
+  // ── Stage 2: Validation ────────────────────────────────────────────────────
+
+  server.registerTool("factcheck_validate", {
+    title: "FactCheck — Validate",
+    description:
+      "Stage 2 of fact-checking: retrieves actual code evidence for each validation item " +
+      "and returns it for you (the AI) to judge.\n\n" +
+      "Call this after `factcheck` has helped you identify items to validate. " +
+      "For each item, provide the claim text, target repository, and search keywords " +
+      "or specific file paths. The tool fetches the code and returns it alongside " +
+      "each claim for your assessment.\n\n" +
+      "IMPORTANT: Do NOT call `query`, `suggestion`, or any NotebookLM-backed tool. " +
+      "Do NOT use web search or fetch external URLs. " +
+      "Base all verdicts exclusively on the code evidence returned by this tool.\n\n" +
+      `Available repositories: ${repoList}`,
+    inputSchema: {
+      document: z.string().optional().describe(
+        "The original document (for reference in validation). Can be condensed.",
+      ),
+      items: z.array(z.record(z.any())).describe(
+        "Validation items. Each object must have: " +
+        "text (string, the claim to validate), " +
+        "repo (string, owner/repo format), " +
+        "keywords (optional string[], search terms), " +
+        "file_paths (optional string[], specific file paths to fetch). " +
+        "Max 20 items.",
+      ),
+    },
+  }, async ({ document, items }) => {
+    if (!items?.length) {
       return {
         content: [{
           type: "text" as const,
-          text: "No valid repository mapping was produced for validation items.",
+          text: "No validation items provided. Call `factcheck` first to plan items.",
         }],
       };
     }
 
-    if (validationItems.length === 0) {
+    // Coerce items into the expected shape
+    const parsed: ValidationItemInput[] = [];
+    for (const raw of items) {
+      const text = typeof raw.text === "string" ? raw.text.trim()
+        : raw.text != null ? String(raw.text).trim()
+        : "";
+      const repo = typeof raw.repo === "string" ? raw.repo.trim()
+        : raw.repo != null ? String(raw.repo).trim()
+        : "";
+      if (!text || !repo) continue;
+      const keywords = Array.isArray(raw.keywords)
+        ? raw.keywords.map((k: unknown) => String(k ?? "").trim()).filter(Boolean)
+        : [];
+      const filePaths = Array.isArray(raw.file_paths)
+        ? raw.file_paths.map((p: unknown) => String(p ?? "").trim()).filter(Boolean)
+        : [];
+      parsed.push({ text, repo, keywords, file_paths: filePaths });
+      if (parsed.length >= MAX_ITEMS) break;
+    }
+
+    if (parsed.length === 0) {
       return {
         content: [{
           type: "text" as const,
-          text: "No actionable validation items were extracted. Provide concrete technical claims (fact/flow/component) to validate.",
+          text: "No valid items after parsing. Each item needs at least `text` (string) and `repo` (string).",
         }],
       };
     }
-    const retrievals = await Promise.all(
-      validationItems.map(item => retrieveClaimEvidence(item, keywordHints)),
+
+    // Validate all referenced repos
+    const uniqueRepos = [...new Set(parsed.map(i => i.repo))];
+    validateRepos(uniqueRepos);
+
+    // Retrieve evidence with limited concurrency to avoid GitHub rate limits.
+    const evidenceResults: ItemEvidence[] = [];
+    for (let i = 0; i < parsed.length; i += MAX_CONCURRENCY) {
+      const batch = parsed.slice(i, i + MAX_CONCURRENCY);
+      const batchResults = await Promise.all(
+        batch.map(item => retrieveEvidence(item)),
+      );
+      evidenceResults.push(...batchResults);
+    }
+
+    const text = buildValidationResponse(
+      (document ?? "").trim(),
+      evidenceResults,
     );
-    const contradictionById = await detectContradictionsWithAi(retrievals);
-
-    const text = buildResponse(
-      effectiveDocument,
-      validationItems,
-      targetRepos,
-      planningNotes,
-      retrievals,
-      contradictionById,
-      plannedItems.length > 0 ? "client-planned" : "ai-planned",
-    );
-
-    if (text.length > MAX_RESPONSE_BYTES) {
-      // Keep response under control for clients with stricter token limits.
-      return {
-        content: [{
-          type: "text" as const,
-          text: `${truncate(text, MAX_RESPONSE_BYTES)}\n\n...(output truncated due size)`
-        }],
-      };
-    }
-
     return { content: [{ type: "text" as const, text }] };
   });
 }
