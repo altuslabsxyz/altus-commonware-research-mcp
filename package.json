@@ -11,10 +11,12 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.1",
     "dotenv": "^16.4.5",
+    "ws": "^8.19.0",
     "zod": "^3.25.7"
   },
   "devDependencies": {
     "@types/node": "^22.19.7",
+    "@types/ws": "^8.18.1",
     "typescript": "^5.5.4"
   }
 }

@@ -4,21 +4,13 @@ A stdio MCP server that queries **Commonware** blockchain research via NotebookL
 
 ## Prerequisites
 
-1. Install `notebooklm-mcp-cli` (Python):
-   ```bash
-   pipx install notebooklm-mcp-cli
-   ```
+1. **Google Chrome** must be installed (used for the built-in `login` flow via Chrome DevTools Protocol).
 
-2. Authenticate with NotebookLM (one-time):
-   ```bash
-   nlm login
-   ```
-
-3. (Optional) Create a GitHub personal access token (for `search_implementation` / `suggestion` / `factcheck` tools):
+2. (Optional) Create a GitHub personal access token (for `search_implementation` / `suggestion` / `factcheck` tools):
    - Go to https://github.com/settings/tokens
    - Generate a token — **no scopes needed** for public repos
 
-4. Clone and build:
+3. Clone and build:
    ```bash
    git clone <repo-url>
    cd altus-commonware-research-mcp
@@ -29,6 +21,8 @@ A stdio MCP server that queries **Commonware** blockchain research via NotebookL
    ```bash
    npm run build
    ```
+
+4. Authenticate with NotebookLM by calling the `login` tool. This launches Chrome, lets you sign in to your Google account, and extracts auth cookies automatically.
 
 ## Configuration
 
@@ -89,9 +83,15 @@ args = ["/absolute/path/to/altus-commonware-research-mcp/dist/index.js"]
 
 ## Tools
 
+### `login`
+
+Authenticate with NotebookLM. Launches Chrome, waits for you to sign in to your Google account, and extracts auth cookies via CDP.
+
+---
+
 ### `refresh_auth`
 
-Reload NotebookLM auth tokens from disk. Run `nlm login` in your terminal first if tokens have expired, then call this tool.
+Reload NotebookLM auth tokens from disk. Use this after re-running `login` in another session, or if tokens were updated externally.
 
 ---
 
