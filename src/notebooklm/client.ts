@@ -1,91 +1,85 @@
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+/**
+ * NotebookLM client — thin wrapper around auth.ts and api.ts.
+ *
+ * Public API kept identical to the old subprocess-based client so consumers
+ * (query.ts, suggestion.ts, factcheck.ts) need zero changes.
+ */
+
 import { NOTEBOOK_ID } from "../config.js";
+import {
+  type AuthTokens,
+  loadCachedTokens,
+  login as authLogin,
+} from "./auth.js";
+import { queryNotebook, resetCsrfState } from "./api.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// NotebookLM MCP Subprocess (notebooklm-mcp from notebooklm-mcp-cli)
+// Cached Tokens (in-memory)
 // ─────────────────────────────────────────────────────────────────────────────
 
-let client: Client | null = null;
-let clientTransport: StdioClientTransport | null = null;
+let cachedTokens: AuthTokens | null = null;
 
-export async function getClient(): Promise<Client> {
-  if (client) return client;
-
-  const t = new StdioClientTransport({ command: "notebooklm-mcp", args: [] });
-  const c = new Client(
-    { name: "altus-tutor-mcp", version: "1.0.0" },
-    { capabilities: {} },
-  );
-
-  await c.connect(t);
-  client = c;
-  clientTransport = t;
-  return c;
+async function ensureAuth(): Promise<AuthTokens> {
+  if (cachedTokens) return cachedTokens;
+  const tokens = loadCachedTokens();
+  if (!tokens) {
+    throw new Error(
+      "Not authenticated. Use the login tool to authenticate with NotebookLM.",
+    );
+  }
+  cachedTokens = tokens;
+  return tokens;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API (signatures unchanged)
+// ─────────────────────────────────────────────────────────────────────────────
+
 /**
- * Ask a question to NotebookLM via the subprocess.
+ * Ask a question to NotebookLM.
+ *
+ * Auth recovery (CSRF refresh, cookie reload) is handled inside
+ * queryNotebook / callRpc, so we just need a clean top-level wrapper.
  */
 export async function askNotebookLm(question: string): Promise<string> {
-  const c = await getClient();
-
-  const result = await c.callTool({
-    name: "notebook_query",
-    arguments: {
-      notebook_id: NOTEBOOK_ID,
-      query: question,
-    },
-  });
-
-  let raw = "";
-  if (result.content && Array.isArray(result.content)) {
-    const texts = result.content
-      .filter((item: any) => item.type === "text")
-      .map((item: any) => item.text);
-    raw = texts.join("\n");
-  } else {
-    raw = String(result.content ?? "");
-  }
-
-  // NotebookLM returns JSON like {"status":"success","answer":"..."}
-  // Extract just the answer so the client AI presents it verbatim.
-  try {
-    const parsed = JSON.parse(raw);
-    if (parsed.answer) return parsed.answer;
-  } catch { /* not JSON, return raw */ }
-
-  return raw || "No response from NotebookLM.";
+  const tokens = await ensureAuth();
+  const answer = await queryNotebook(NOTEBOOK_ID, question, tokens);
+  return answer || "No response from NotebookLM.";
 }
 
 /**
- * Refresh auth tokens from disk (after user runs `nlm login` separately).
+ * Interactive login via Chrome CDP.
  */
-export async function refreshAuth(): Promise<string> {
-  const c = await getClient();
-
-  const result = await c.callTool({
-    name: "refresh_auth",
-    arguments: {},
-  });
-
-  if (result.content && Array.isArray(result.content)) {
-    const texts = result.content
-      .filter((item: any) => item.type === "text")
-      .map((item: any) => item.text);
-    return texts.join("\n");
-  }
-
-  return "Auth refreshed.";
+export async function login(): Promise<string> {
+  const tokens = await authLogin();
+  cachedTokens = tokens;
+  return "Login successful. Authentication tokens saved.";
 }
 
+/**
+ * Reload tokens from disk (e.g. after external re-authentication).
+ */
+export async function refreshAuth(): Promise<string> {
+  const tokens = loadCachedTokens();
+  if (!tokens) {
+    return "No cached tokens found. Use the login tool to authenticate first.";
+  }
+  cachedTokens = tokens;
+  resetCsrfState(); // Force CSRF re-fetch on next API call
+  return "Auth tokens reloaded from disk.";
+}
+
+/**
+ * Clear cached tokens (called during shutdown).
+ */
 export async function closeClient(): Promise<void> {
-  if (client) {
-    try { await client.close(); } catch { /* ignore */ }
-    client = null;
-  }
-  if (clientTransport) {
-    try { await clientTransport.close(); } catch { /* ignore */ }
-    clientTransport = null;
-  }
+  cachedTokens = null;
+}
+
+/**
+ * Eagerly load cached tokens from disk (fire-and-forget on startup).
+ */
+export function preloadAuth(): void {
+  const tokens = loadCachedTokens();
+  if (tokens) cachedTokens = tokens;
 }

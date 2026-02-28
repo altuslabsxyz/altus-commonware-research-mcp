@@ -1,1 +1,1 @@
-export { getClient, askNotebookLm, refreshAuth, closeClient } from "./client.js";
+export { askNotebookLm, login, refreshAuth, closeClient, preloadAuth } from "./client.js";
