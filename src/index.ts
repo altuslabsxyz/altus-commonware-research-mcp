@@ -3,6 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { registerTools } from "./tools/index.js";
 import { closeClient, preloadAuth } from "./notebooklm/index.js";
 import { preloadTrees } from "./github/index.js";
+import { closeDb } from "./db/index.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MCP Server (stdio transport)
@@ -24,6 +25,7 @@ preloadTrees();
 // Graceful Shutdown
 // ─────────────────────────────────────────────────────────────────────────────
 process.on("SIGINT", async () => {
+  closeDb();
   await closeClient();
   await server.close();
   process.exit(0);

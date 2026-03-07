@@ -22,7 +22,17 @@ A stdio MCP server that queries **Commonware** blockchain research via NotebookL
    npm run build
    ```
 
-4. Authenticate with NotebookLM by calling the `login` tool. This launches Chrome, lets you sign in to your Google account, and extracts auth cookies automatically.
+4. Build the local code search index (requires `GITHUB_TOKEN` and `REFERENCE_REPOS` in `.env`):
+   ```bash
+   npm run setup-index
+   ```
+   This fetches file trees and content from all `REFERENCE_REPOS` and stores them in a local SQLite FTS5 database (`data/index.db`) for fast code search. To re-index later (e.g. after upstream changes), run with `--force`:
+   ```bash
+   npm run setup-index -- --force
+   ```
+   You can also re-index at runtime via the `setup_db` MCP tool.
+
+5. Authenticate with NotebookLM by calling the `login` tool. This launches Chrome, lets you sign in to your Google account, and extracts auth cookies automatically.
 
 ## Configuration
 
@@ -39,6 +49,7 @@ GITHUB_TOKEN=ghp_...
 | `NOTEBOOK_ID` | Yes | NotebookLM notebook ID (from the notebook URL) |
 | `REFERENCE_REPOS` | Yes | Comma-separated list of GitHub repos (`owner/name`). These are the repos that `suggestion`, `search_implementation`, and `factcheck` search against. |
 | `GITHUB_TOKEN` | No | GitHub personal access token. No scopes needed for public repos, but recommended to avoid rate limits. |
+| `SQLITE_DB_PATH` | No | Path to SQLite database file. Default: `data/index.db` in the project root. |
 
 The `REFERENCE_REPOS` list determines which repositories the tools can search. Tools like `suggestion` and `factcheck` auto-select the most relevant repos from this list per query, or you can override with the `repos` argument.
 
@@ -210,3 +221,13 @@ Search reference repository and return source code snippets **explaining how the
 > - Treat Tempo epoch/DKG sections and some deep flow claims as "needs explicit code citations" before calling it fully validated.
 >
 > *(truncated — full output includes claim-by-claim verdict table, evidence appendix, and fix suggestions)*
+
+---
+
+### `setup_db`
+
+Initialize or re-index the local SQLite FTS5 search index at runtime. Same as `npm run setup-index` but callable as an MCP tool.
+
+- **Arguments**:
+  - `repos` (optional): Subset of `REFERENCE_REPOS` to index.
+  - `force` (optional): Re-index even if already indexed.
