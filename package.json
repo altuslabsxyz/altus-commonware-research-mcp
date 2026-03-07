@@ -6,15 +6,18 @@
   "private": true,
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "setup-index": "node dist/cli/setup-index.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.1",
+    "better-sqlite3": "^11.10.0",
     "dotenv": "^16.4.5",
     "ws": "^8.19.0",
     "zod": "^3.25.7"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.19.7",
     "@types/ws": "^8.18.1",
     "typescript": "^5.5.4"

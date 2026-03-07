@@ -21,3 +21,9 @@ export const GITHUB_TOKEN = process.env.GITHUB_TOKEN ?? "";
 export const REFERENCE_REPOS: readonly string[] = (
   process.env.REFERENCE_REPOS ?? ""
 ).split(",").map(r => r.trim()).filter(Boolean);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SQLite Configuration
+// ─────────────────────────────────────────────────────────────────────────────
+export const SQLITE_DB_PATH = process.env.SQLITE_DB_PATH ??
+  resolve(FILE_DIR, "..", "data", "index.db");

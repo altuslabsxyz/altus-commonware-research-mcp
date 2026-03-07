@@ -4,3 +4,6 @@ dist
 
 # Env
 .env
+
+# SQLite data
+data/
